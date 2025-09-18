@@ -1,0 +1,23 @@
+{
+    "python.analysis.autoImportCompletions": true,
+    "python.analysis.typeCheckingMode": "basic",
+    "justMyCode": false,
+    "jupyter.debugJustMyCode": false,
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "[javascript]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+	{
+  "editor.wordWrap": "on",
+  "editor.wordWrapColumn": 120
+},
+	
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+
+    "[python]": {
+        "editor.wordWrap": "on"
+    }
+    
+
+}
