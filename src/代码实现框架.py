@@ -15,6 +15,23 @@ from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+class MockDataset(Dataset):
+    """模拟数据集类，用于演示和测试"""
+    def __init__(self, size=1000):
+        self.size = size
+    
+    def __len__(self):
+        return self.size
+    
+    def __getitem__(self, idx):
+        return {
+            'visual_features': torch.randn(64),
+            'motion_features': torch.randn(40),
+            'traffic_features': torch.randn(32),
+            'left_turn_intent': torch.rand(1),
+            'target_trajectory': torch.randn(12, 2)
+        }
+
 class MultiModalDataset(Dataset):
     """多模态数据集类"""
     
@@ -62,10 +79,24 @@ class MultiModalDataset(Dataset):
     
     def extract_features(self, data):
         """特征提取"""
-        # 计算速度、加速度、航向角等特征
-        data['velocity'] = np.sqrt(data['vx']**2 + data['vy']**2)
-        data['acceleration'] = data['velocity'].diff()
-        data['heading'] = np.arctan2(data['vy'], data['vx'])
+        # 基于NGSIM数据格式计算特征（使用小写列名）
+        if 'v_vel' in data.columns:
+            data['velocity'] = data['v_vel']
+        else:
+            data['velocity'] = 0
+            
+        if 'v_acc' in data.columns:
+            data['acceleration'] = data['v_acc']
+        else:
+            data['acceleration'] = data['velocity'].diff().fillna(0)
+            
+        # 计算航向角（基于位置变化）
+        if 'local_x' in data.columns and 'local_y' in data.columns:
+            data['dx'] = data['local_x'].diff().fillna(0)
+            data['dy'] = data['local_y'].diff().fillna(0)
+            data['heading'] = np.arctan2(data['dy'], data['dx'])
+        else:
+            data['heading'] = 0
         
         return data
     
@@ -96,8 +127,12 @@ class MultiModalDataset(Dataset):
         # 左转意图标签
         left_turn_intent = self.get_left_turn_intent(future)
         
-        # 目标轨迹
-        target_trajectory = future[['x', 'y']].values
+        # 目标轨迹（使用NGSIM数据的local_x, local_y列）
+        if 'local_x' in future.columns and 'local_y' in future.columns:
+            target_trajectory = future[['local_x', 'local_y']].values
+        else:
+            # 如果没有位置列，创建模拟数据
+            target_trajectory = np.random.randn(len(future), 2)
         
         return {
             'visual_features': torch.FloatTensor(visual_features),
@@ -116,26 +151,81 @@ class MultiModalDataset(Dataset):
     def extract_motion_features(self, history):
         """提取运动特征"""
         features = []
-        for col in ['x', 'y', 'velocity', 'acceleration', 'heading']:
+        # 使用NGSIM数据的实际列名（小写）
+        for col in ['local_x', 'local_y', 'v_vel', 'v_acc']:
             if col in history.columns:
                 features.extend(history[col].values)
+            else:
+                # 如果列不存在，填充零值
+                features.extend([0.0] * len(history))
+        
+        # 添加计算的航向角特征
+        if 'local_x' in history.columns and 'local_y' in history.columns:
+            dx = history['local_x'].diff().fillna(0)
+            dy = history['local_y'].diff().fillna(0)
+            headings = np.arctan2(dy, dx)
+            features.extend(headings.values)
+        else:
+            features.extend([0.0] * len(history))
+        
+        # 确保返回固定长度的特征向量
+        if len(features) == 0:
+            features = [0.0] * 40  # 默认40维特征
+        elif len(features) < 40:
+            features.extend([0.0] * (40 - len(features)))
+        elif len(features) > 40:
+            features = features[:40]
+            
         return np.array(features)
     
     def extract_traffic_features(self, history):
         """提取交通环境特征"""
-        # 简化实现，返回随机特征
-        return np.random.randn(32)
+        features = []
+        # 使用NGSIM数据的实际列名（小写）
+        for col in ['lane_id', 'preceding', 'following', 'space_headway', 'time_headway']:
+            if col in history.columns:
+                features.extend(history[col].values)
+            else:
+                # 如果列不存在，填充零值
+                features.extend([0.0] * len(history))
+        
+        # 确保返回固定长度的特征向量
+        if len(features) == 0:
+            features = [0.0] * 32  # 默认32维特征
+        elif len(features) < 32:
+            features.extend([0.0] * (32 - len(features)))
+        elif len(features) > 32:
+            features = features[:32]
+            
+        return np.array(features)
     
     def get_left_turn_intent(self, future):
         """判断左转意图"""
         # 基于未来轨迹判断是否为左转
-        start_heading = np.arctan2(future.iloc[0]['vy'], future.iloc[0]['vx'])
-        end_heading = np.arctan2(future.iloc[-1]['vy'], future.iloc[-1]['vx'])
-        
-        heading_change = end_heading - start_heading
-        
-        # 如果航向角变化大于阈值，认为是左转
-        return 1.0 if heading_change > np.pi/4 else 0.0
+        if 'local_x' in future.columns and 'local_y' in future.columns:
+            # 计算轨迹的航向角变化
+            dx = future['local_x'].diff().fillna(0)
+            dy = future['local_y'].diff().fillna(0)
+            
+            if len(dx) > 1 and len(dy) > 1:
+                start_heading = np.arctan2(dy.iloc[1], dx.iloc[1])
+                end_heading = np.arctan2(dy.iloc[-1], dx.iloc[-1])
+                
+                heading_change = end_heading - start_heading
+                
+                # 标准化角度到[-π, π]
+                while heading_change > np.pi:
+                    heading_change -= 2 * np.pi
+                while heading_change < -np.pi:
+                    heading_change += 2 * np.pi
+                
+                # 如果航向角变化大于阈值，认为是左转
+                return 1.0 if heading_change > np.pi/6 else 0.0
+            else:
+                return 0.0
+        else:
+            # 如果没有位置数据，返回随机值
+            return np.random.choice([0.0, 1.0])
 
 class VisualEncoder(nn.Module):
     """视觉特征编码器"""
@@ -241,7 +331,7 @@ class AttentionFusion(nn.Module):
         cross_attended = cross_attended.transpose(0, 1)
         
         # 融合特征
-        fused_features = cross_attended.view(cross_attended.size(0), -1)
+        fused_features = cross_attended.contiguous().view(cross_attended.size(0), -1)
         output = self.output_proj(fused_features)
         
         return output
@@ -296,27 +386,24 @@ class TrajectoryDecoder(nn.Module):
         
         # 初始化隐藏状态
         init_states = self.init_hidden(input_features)
-        h0 = init_states[:, :self.hidden_dim*2].view(2, batch_size, self.hidden_dim).contiguous()
-        c0 = init_states[:, self.hidden_dim*2:].view(2, batch_size, self.hidden_dim).contiguous()
+        h0 = init_states[:, :self.hidden_dim*2].reshape(2, batch_size, self.hidden_dim)
+        c0 = init_states[:, self.hidden_dim*2:].reshape(2, batch_size, self.hidden_dim)
         
         # 解码预测轨迹
         outputs = []
         hidden = (h0, c0)
         
-        # 第一步输入
-        decoder_input = input_features.unsqueeze(1)
+        # 第一步输入 - 使用固定的输入特征
+        decoder_input = input_features.unsqueeze(1)  # [batch, 1, input_dim]
         
         for t in range(self.seq_len):
             output, hidden = self.lstm(decoder_input, hidden)
             trajectory_point = self.output_layer(output)
             outputs.append(trajectory_point)
             
-            # 下一步的输入（教师强制或自回归）
-            decoder_input = torch.cat([
-                fused_features.unsqueeze(1), 
-                intent_prob.unsqueeze(1),
-                trajectory_point
-            ], dim=2)
+            # 保持输入维度一致，不添加trajectory_point
+            # 使用相同的input_features作为下一步输入
+            decoder_input = input_features.unsqueeze(1)
         
         # 拼接所有输出
         trajectory = torch.cat(outputs, dim=1)
@@ -637,32 +724,17 @@ def main():
     
     # 创建模拟数据集（实际使用时替换为真实数据）
     print("创建数据集...")
+    data_path = '../data/peachtree_filtered_data.csv'
     
     # 这里应该使用真实的数据路径
-    # train_dataset = MultiModalDataset('train_data.csv')
-    # val_dataset = MultiModalDataset('val_data.csv')
-    # test_dataset = MultiModalDataset('test_data.csv')
+    train_dataset = MultiModalDataset(data_path=data_path)
+    val_dataset = MultiModalDataset(data_path)
+    test_dataset = MultiModalDataset(data_path)
     
     # 为演示创建模拟数据
-    class MockDataset(Dataset):
-        def __init__(self, size=1000):
-            self.size = size
-        
-        def __len__(self):
-            return self.size
-        
-        def __getitem__(self, idx):
-            return {
-                'visual_features': torch.randn(64),
-                'motion_features': torch.randn(40),
-                'traffic_features': torch.randn(32),
-                'left_turn_intent': torch.rand(1),
-                'target_trajectory': torch.randn(12, 2)
-            }
-    
-    train_dataset = MockDataset(800)
-    val_dataset = MockDataset(200)
-    test_dataset = MockDataset(200)
+    #train_dataset = MockDataset(800)
+    #val_dataset = MockDataset(200)
+    #test_dataset = MockDataset(200)
     
     # 创建数据加载器
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)

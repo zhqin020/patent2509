@@ -13,13 +13,15 @@
 - **时空注意力机制**：有效捕获车辆间的复杂交互关系
 - **实时预测能力**：优化的模型结构支持实时应用
 - **完整的评估体系**：提供全面的性能评估和可视化
+- **详细数据分析**：提供3-5个左转车辆样例的特征提取和轨迹可视化
+- **预测对比分析**：展示3-5个预测样例与实际数据的详细对比
 
 ## 项目结构
 
 ```
-└── data/         #数据目录
+├── data/         #数据目录
 |   ├── peachtree_filtered_data.csv            # NGSIM数据， peachtree 路口车辆行驶数据
-|   └── 
+|   └── peachtree_filtered_data.zip            # 压缩的数据文件
 ├── docs/         #文档目录
 |   ├── 车辆左转轨迹预测-专利说明书.md    # 专利格式的技术说明书
 |   ├── 研究设计方案.md                   # 详细的研究设计方案
@@ -27,18 +29,23 @@
 |   ├── 预测范围与评价方法详解.md                   # 全面的车辆左转轨迹预测系统评价体系说明
 |   ├── 专利写作说明书.pdf                   # 专利说明书写作指导
 |   ├── 大数据技术综合课程设计-说明.pdf                   # 课程设计要求
-|   └── 课程设计报告模板-发明专利说明书.pdf                   # 发明专利书模板
+|   ├── 大数据技术综合课程设计说明.docx                   # 课程设计要求（Word版本）
+|   ├── 课程设计报告模板-发明专利说明书.docx                   # 发明专利书模板（Word版本）
+|   └── 课程设计报告模板-发明专利说明书.pdf                   # 发明专利书模板（PDF版本）
+├── test/         #测试代码目录
 ├── src/         #程序代码目录
 |   ├── 代码实现框架.py                   # 核心模型实现
 |   ├── 数据处理脚本.py                   # NGSIM数据处理工具
 |   ├── 实验评估脚本.py                   # 模型评估和可视化
-|   ├── left_detect.ipynb              # 数据筛选工具
-|   └── 评价指标实现代码.py                   # 完整的评价指标实现代码 
-├── README.md                         # 项目说明文档
-└── sodapy/                           # 数据处理相关工具
-    └── examples/
-        ├── filter_data.py            # 数据过滤脚本
-        └── filter_peachtree_data.py  # 特定数据筛选
+|   ├── 评价指标实现代码.py                   # 完整的评价指标实现代码
+|   ├── 左转数据分析脚本.py                   # 左转车辆数据筛选和轨迹分析工具
+|   ├── 预测样例对比脚本.py                   # 预测结果与实际数据对比分析工具
+|   ├── left_detect_fixed.ipynb        # 左转车辆检测和数据筛选工具（修复版）
+|   ├── left_fixed.ipynb               # 左转轨迹分析和可视化工具（修复版）
+|   └── left.ipynb                    # 左转轨迹分析和可视化工具（原版）
+├── test/        #测试程序目录
+|   └── test_model.py                 # 模型功能测试程序
+└── README.md                         # 项目说明文档
 ```
 
 ## 技术架构
@@ -85,26 +92,57 @@ pip install torch torchvision numpy pandas matplotlib seaborn scikit-learn openc
 
 ### 数据准备
 
-1. **下载NGSIM数据集**
+1. **使用项目数据**
    ```bash
-   # 将NGSIM数据文件放置在项目根目录
-   # 支持的格式：.csv, .txt
+   # 项目已包含处理好的NGSIM数据
+   # data/peachtree_filtered_data.csv - peachtree路口的车辆行驶数据
    ```
 
 2. **数据预处理**
    ```bash
-   python 数据处理脚本.py
+   python src/数据处理脚本.py
    ```
 
-3. **筛选左转数据**（可选）
+3. **左转车辆检测和特征分析**
    ```bash
-   python process_peachtree.py
+   # 使用专门的左转数据分析脚本（推荐）
+   python src/左转数据分析脚本.py
+   
+   # 或使用修复后的Jupyter notebook进行数据分析
+   jupyter notebook src/left_detect_fixed.ipynb
+   # 或使用左转轨迹分析工具
+   jupyter notebook src/left_fixed.ipynb
    ```
+
+4. **预测结果对比分析**
+   ```bash
+   # 运行预测样例对比分析
+   python src/预测样例对比脚本.py
+   ```
+
+### 模型测试
+
+```bash
+# 运行完整测试套件（推荐）
+python test/run_tests_fixed.py
+
+# 或单独运行各项测试
+python test/test_model_fixed.py
+python test/test_data_analysis_fixed.py
+```
+
+测试程序将验证：
+- 模型导入和创建
+- 数据集创建和加载
+- 前向传播功能
+- 训练步骤执行
+- 左转数据分析功能
+- 预测对比分析功能
 
 ### 模型训练
 
 ```bash
-python 代码实现框架.py
+python src/代码实现框架.py
 ```
 
 训练过程将自动：
@@ -117,7 +155,7 @@ python 代码实现框架.py
 ### 模型评估
 
 ```bash
-python 实验评估脚本.py
+python src/实验评估脚本.py
 ```
 
 评估将生成：
@@ -173,15 +211,18 @@ python 实验评估脚本.py
 
 ### 工具文件
 
-- **`process_peachtree.py`**：用于从交通数据中筛选特定区域的车辆轨迹
-- **`sodapy/examples/`**：数据处理和过滤的辅助工具
+- **`左转数据分析脚本.py`**：专门用于左转车辆数据筛选和轨迹分析，提供详细的特征提取和可视化
+- **`预测样例对比脚本.py`**：预测结果与实际数据的对比分析工具，展示模型预测性能
+- **`left_detect_fixed.ipynb`**：用于左转车辆检测和数据筛选的Jupyter notebook（修复版，使用NGSIM数据）
+- **`left_fixed.ipynb`**：左转轨迹分析和可视化工具（修复版，使用NGSIM数据）
+- **`left.ipynb`**：左转轨迹分析和可视化工具（原版）
 
 ## 使用示例
 
 ### 基本使用
 
 ```python
-from 代码实现框架 import LeftTurnPredictor, TrainingManager
+from src.代码实现框架 import LeftTurnPredictor, TrainingManager
 import torch
 
 # 创建模型
@@ -201,10 +242,10 @@ results = evaluate_model(model, test_loader)
 ### 数据处理
 
 ```python
-from 数据处理脚本 import NGSIMDataProcessor
+from src.数据处理脚本 import NGSIMDataProcessor
 
 # 创建数据处理器
-processor = NGSIMDataProcessor('ngsim_data.csv')
+processor = NGSIMDataProcessor('data/peachtree_filtered_data.csv')
 
 # 加载和预处理数据
 processor.load_data()
@@ -215,6 +256,40 @@ processor.identify_left_turn_vehicles()
 
 # 保存处理结果
 processor.save_processed_data()
+```
+
+### 左转数据分析
+
+```python
+from src.左转数据分析脚本 import LeftTurnAnalyzer
+
+# 创建左转分析器
+analyzer = LeftTurnAnalyzer('data/peachtree_filtered_data.csv')
+
+# 运行完整分析流程
+analyzer.run_complete_analysis(num_samples=5)
+
+# 输出：
+# - 5个左转车辆样例的详细特征数据
+# - 轨迹可视化图表
+# - 特征统计分析报告
+```
+
+### 预测结果对比
+
+```python
+from src.预测样例对比脚本 import PredictionComparator
+
+# 创建预测对比分析器
+comparator = PredictionComparator('data/peachtree_filtered_data.csv')
+
+# 运行完整对比分析
+comparator.run_complete_comparison(num_samples=5)
+
+# 输出：
+# - 5个预测样例与实际数据的详细对比
+# - 预测性能指标分析
+# - 可视化对比图表
 ```
 
 ## 贡献指南

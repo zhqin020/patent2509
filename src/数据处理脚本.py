@@ -568,9 +568,9 @@ def main():
     print("=" * 50)
     
     # 数据文件路径（需要根据实际情况修改）
-    data_path = input("请输入NGSIM数据文件路径 (默认: transportation_data_complete.csv): ").strip()
+    data_path = input("请输入NGSIM数据文件路径 (默认: data/peachtree_filtered_data.csv): ").strip()
     if not data_path:
-        data_path = "transportation_data_complete.csv"
+        data_path = "data/peachtree_filtered_data.csv"
     
     # 检查文件是否存在
     if not os.path.exists(data_path):
