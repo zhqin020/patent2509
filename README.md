@@ -44,7 +44,11 @@
 |   ├── left_fixed.ipynb               # 左转轨迹分析和可视化工具（修复版）
 |   └── left.ipynb                    # 左转轨迹分析和可视化工具（原版）
 ├── test/        #测试程序目录
-|   └── test_model.py                 # 模型功能测试程序
+|   ├── test_model.py                 # 模型功能测试程序
+|   ├── training_demo.py              # 训练进度条演示程序
+|   ├── progress_bar_test.py          # 进度条功能测试
+|   ├── simple_data_test.py           # 简单数据兼容性测试
+|   └── ngsim_data_test.py            # NGSIM数据格式测试
 └── README.md                         # 项目说明文档
 ```
 
@@ -87,8 +91,10 @@ OpenCV >= 4.5.0
 ### 安装依赖
 
 ```bash
-pip install torch torchvision numpy pandas matplotlib seaborn scikit-learn opencv-python scipy
+pip install torch torchvision numpy pandas matplotlib seaborn scikit-learn opencv-python scipy tqdm
 ```
+
+**注意**：新增了`tqdm`库用于显示训练进度条，提供更好的训练体验。
 
 ### 数据准备
 
@@ -129,6 +135,12 @@ python test/run_tests_fixed.py
 # 或单独运行各项测试
 python test/test_model_fixed.py
 python test/test_data_analysis_fixed.py
+
+# 新增测试程序
+python test/training_demo.py          # 训练进度条演示
+python test/progress_bar_test.py      # 进度条功能测试
+python test/simple_data_test.py       # 数据兼容性测试
+python test/ngsim_data_test.py        # NGSIM数据格式测试
 ```
 
 测试程序将验证：
@@ -138,6 +150,9 @@ python test/test_data_analysis_fixed.py
 - 训练步骤执行
 - 左转数据分析功能
 - 预测对比分析功能
+- **新增**：进度条显示功能
+- **新增**：NGSIM数据格式兼容性
+- **新增**：训练过程监控和可视化
 
 ### 模型训练
 
@@ -145,12 +160,34 @@ python test/test_data_analysis_fixed.py
 python src/代码实现框架.py
 ```
 
+**新增功能**：训练过程现在包含详细的进度条和实时监控：
+
+- **实时进度条**：显示每个epoch和batch的训练进度
+- **性能监控**：实时显示训练损失、验证损失、准确率等指标
+- **时间估算**：提供ETA（预计完成时间）和已用时间统计
+- **智能显示**：包含emoji图标的友好界面，清晰展示训练状态
+- **早停监控**：显示早停计数器和最佳模型保存状态
+
 训练过程将自动：
 - 加载和预处理数据
 - 构建多模态模型
-- 执行训练循环
+- 执行带进度条的训练循环
+- 实时显示训练状态和性能指标
 - 保存最佳模型权重
 - 生成训练历史图表
+
+**训练演示**：
+```bash
+# 运行训练演示程序（推荐新用户）
+python test/training_demo.py
+```
+
+该演示程序将展示：
+- 📊 数据集准备过程
+- 🏗️ 模型初始化信息
+- 🚀 带进度条的训练过程
+- 📈 实时性能指标监控
+- ⏱️ 时间估算和ETA显示
 
 ### 模型评估
 

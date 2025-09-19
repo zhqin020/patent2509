@@ -14,6 +14,8 @@ import cv2
 from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 import seaborn as sns
+import time
+from tqdm import tqdm
 
 class MockDataset(Dataset):
     """模拟数据集类，用于演示和测试"""
@@ -474,7 +476,7 @@ class TrainingManager:
         self.train_history = {'loss': [], 'intent_acc': [], 'traj_error': []}
         self.val_history = {'loss': [], 'intent_acc': [], 'traj_error': []}
     
-    def train_epoch(self):
+    def train_epoch(self, epoch_num=None, total_epochs=None):
         """训练一个epoch"""
         self.model.train()
         total_loss = 0
@@ -482,7 +484,14 @@ class TrainingManager:
         total_samples = 0
         traj_error = 0
         
-        for batch in self.train_loader:
+        # 创建进度条
+        desc = f"Epoch {epoch_num}/{total_epochs} [Train]" if epoch_num and total_epochs else "Training"
+        pbar = tqdm(self.train_loader, desc=desc, leave=False)
+        
+        batch_losses = []
+        batch_start_time = time.time()
+        
+        for batch_idx, batch in enumerate(pbar):
             # 数据移到设备
             visual_feat = batch['visual_features'].to(self.device)
             motion_feat = batch['motion_features'].to(self.device)
@@ -507,10 +516,29 @@ class TrainingManager:
             self.optimizer.step()
             
             # 统计
-            total_loss += total_batch_loss.item()
+            batch_loss = total_batch_loss.item()
+            total_loss += batch_loss
+            batch_losses.append(batch_loss)
             intent_correct += ((intent_pred > 0.5) == (intent_target > 0.5)).sum().item()
             total_samples += intent_target.size(0)
             traj_error += torch.sqrt(torch.mean((traj_pred - traj_target) ** 2)).item()
+            
+            # 更新进度条信息
+            if batch_idx % 5 == 0:  # 每5个batch更新一次
+                current_avg_loss = np.mean(batch_losses[-10:]) if len(batch_losses) >= 10 else np.mean(batch_losses)
+                current_intent_acc = intent_correct / total_samples if total_samples > 0 else 0
+                
+                # 计算处理速度
+                elapsed_time = time.time() - batch_start_time
+                samples_per_sec = total_samples / elapsed_time if elapsed_time > 0 else 0
+                
+                pbar.set_postfix({
+                    'Loss': f'{current_avg_loss:.4f}',
+                    'IntentAcc': f'{current_intent_acc:.3f}',
+                    'Speed': f'{samples_per_sec:.1f}samples/s'
+                })
+        
+        pbar.close()
         
         avg_loss = total_loss / len(self.train_loader)
         intent_acc = intent_correct / total_samples
@@ -518,7 +546,7 @@ class TrainingManager:
         
         return avg_loss, intent_acc, avg_traj_error
     
-    def validate(self):
+    def validate(self, epoch_num=None, total_epochs=None):
         """验证"""
         self.model.eval()
         total_loss = 0
@@ -526,8 +554,12 @@ class TrainingManager:
         total_samples = 0
         traj_error = 0
         
+        # 创建验证进度条
+        desc = f"Epoch {epoch_num}/{total_epochs} [Valid]" if epoch_num and total_epochs else "Validating"
+        pbar = tqdm(self.val_loader, desc=desc, leave=False)
+        
         with torch.no_grad():
-            for batch in self.val_loader:
+            for batch_idx, batch in enumerate(pbar):
                 # 数据移到设备
                 visual_feat = batch['visual_features'].to(self.device)
                 motion_feat = batch['motion_features'].to(self.device)
@@ -548,6 +580,18 @@ class TrainingManager:
                 intent_correct += ((intent_pred > 0.5) == (intent_target > 0.5)).sum().item()
                 total_samples += intent_target.size(0)
                 traj_error += torch.sqrt(torch.mean((traj_pred - traj_target) ** 2)).item()
+                
+                # 更新进度条信息
+                if batch_idx % 3 == 0:  # 验证时更频繁更新
+                    current_avg_loss = total_loss / (batch_idx + 1)
+                    current_intent_acc = intent_correct / total_samples if total_samples > 0 else 0
+                    
+                    pbar.set_postfix({
+                        'Loss': f'{current_avg_loss:.4f}',
+                        'IntentAcc': f'{current_intent_acc:.3f}'
+                    })
+        
+        pbar.close()
         
         avg_loss = total_loss / len(self.val_loader)
         intent_acc = intent_correct / total_samples
@@ -560,20 +604,32 @@ class TrainingManager:
         best_val_loss = float('inf')
         patience_counter = 0
         
-        print("开始训练...")
-        print(f"训练集大小: {len(self.train_loader.dataset)}")
-        print(f"验证集大小: {len(self.val_loader.dataset)}")
-        print("-" * 60)
+        print("🚀 开始训练...")
+        print(f"📊 训练集大小: {len(self.train_loader.dataset):,}")
+        print(f"📊 验证集大小: {len(self.val_loader.dataset):,}")
+        print(f"🎯 目标轮数: {epochs}")
+        print(f"⏰ 早停耐心: {early_stopping_patience}")
+        print(f"💻 设备: {self.device}")
+        print("=" * 80)
         
-        for epoch in range(epochs):
+        # 总体进度条
+        epoch_pbar = tqdm(range(epochs), desc="Overall Progress", position=0)
+        
+        training_start_time = time.time()
+        
+        for epoch in epoch_pbar:
+            epoch_start_time = time.time()
+            
             # 训练
-            train_loss, train_intent_acc, train_traj_error = self.train_epoch()
+            train_loss, train_intent_acc, train_traj_error = self.train_epoch(epoch+1, epochs)
             
             # 验证
-            val_loss, val_intent_acc, val_traj_error = self.validate()
+            val_loss, val_intent_acc, val_traj_error = self.validate(epoch+1, epochs)
             
             # 学习率调度
+            old_lr = self.optimizer.param_groups[0]['lr']
             self.scheduler.step(val_loss)
+            new_lr = self.optimizer.param_groups[0]['lr']
             
             # 记录历史
             self.train_history['loss'].append(train_loss)
@@ -584,27 +640,66 @@ class TrainingManager:
             self.val_history['intent_acc'].append(val_intent_acc)
             self.val_history['traj_error'].append(val_traj_error)
             
-            # 打印进度
-            print(f"Epoch {epoch+1:3d}/{epochs} | "
-                  f"Train Loss: {train_loss:.4f} | "
-                  f"Val Loss: {val_loss:.4f} | "
-                  f"Intent Acc: {val_intent_acc:.3f} | "
-                  f"Traj Error: {val_traj_error:.3f}")
+            # 计算时间统计
+            epoch_time = time.time() - epoch_start_time
+            total_elapsed = time.time() - training_start_time
+            avg_epoch_time = total_elapsed / (epoch + 1)
+            eta = avg_epoch_time * (epochs - epoch - 1)
             
-            # 早停检查
+            # 早停检查和模型保存
+            improvement = ""
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
-                # 保存最佳模型
                 torch.save(self.model.state_dict(), 'best_model.pth')
+                improvement = "💾 [BEST]"
             else:
                 patience_counter += 1
-                
+                if patience_counter >= early_stopping_patience:
+                    improvement = "⏹️ [EARLY STOP]"
+            
+            # 学习率变化提示
+            lr_info = f"📉 LR: {old_lr:.2e}" if new_lr == old_lr else f"📉 LR: {old_lr:.2e}→{new_lr:.2e}"
+            
+            # 更新总体进度条
+            epoch_pbar.set_postfix({
+                'Train_Loss': f'{train_loss:.4f}',
+                'Val_Loss': f'{val_loss:.4f}',
+                'Val_Acc': f'{val_intent_acc:.3f}',
+                'Patience': f'{patience_counter}/{early_stopping_patience}',
+                'ETA': f'{eta/60:.1f}min'
+            })
+            
+            # 详细信息输出
+            epoch_info = f"📈 Epoch {epoch+1:3d}/{epochs} | " + \
+                        f"⏱️ {epoch_time:.1f}s | " + \
+                        f"🔄 Train: {train_loss:.4f} | " + \
+                        f"✅ Valid: {val_loss:.4f} | " + \
+                        f"🎯 Acc: {val_intent_acc:.3f} | " + \
+                        f"📏 TrajErr: {val_traj_error:.3f}"
+            print(epoch_info)
+            
+            detail_info = f"    {lr_info} | " + \
+                         f"⏳ ETA: {eta/60:.1f}min | " + \
+                         f"🕐 Total: {total_elapsed/60:.1f}min | " + \
+                         f"{improvement}"
+            print(detail_info)
+            
             if patience_counter >= early_stopping_patience:
-                print(f"早停触发，在第 {epoch+1} 轮停止训练")
+                print(f"⏹️ 早停触发！在第 {epoch+1} 轮停止训练")
+                print(f"🏆 最佳验证损失: {best_val_loss:.4f}")
                 break
         
-        print("训练完成！")
+        epoch_pbar.close()
+        
+        total_training_time = time.time() - training_start_time
+        print("" + "=" * 80)
+        print("🎉 训练完成！")
+        print(f"⏱️ 总训练时间: {total_training_time/60:.1f} 分钟")
+        print(f"🏆 最佳验证损失: {best_val_loss:.4f}")
+        print(f"💾 最佳模型已保存为: best_model.pth")
+        print("=" * 80)
+        
         return self.train_history, self.val_history
     
     def plot_training_history(self):

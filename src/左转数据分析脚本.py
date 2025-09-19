@@ -39,65 +39,489 @@ class LeftTurnAnalyzer:
             print(f"正在加载数据: {self.data_path}")
             self.raw_data = pd.read_csv(self.data_path)
             print(f"数据加载成功，共 {len(self.raw_data)} 条记录")
-            print(f"包含 {len(self.raw_data['Vehicle_ID'].unique())} 辆车辆")
+            print(f"包含 {len(self.raw_data['vehicle_id'].unique())} 辆车辆")
             return True
         except Exception as e:
             print(f"数据加载失败: {e}")
             return False
     
-    def identify_left_turn_vehicles(self, heading_threshold=30):
+    def identify_left_turn_vehicles(self, heading_threshold=75, min_trajectory_length=100):
         """
-        识别左转车辆
+        精确的左转车辆识别算法 - 区分左转、掉头、复杂机动
         
         Args:
-            heading_threshold: 航向角变化阈值（度）
+            heading_threshold: 航向角变化阈值（度，默认75度）
+            min_trajectory_length: 最小轨迹长度（默认100个点）
         """
         if self.raw_data is None:
             print("请先加载数据")
             return False
         
-        print("正在识别左转车辆...")
-        left_turn_vehicles = []
+        print("正在进行精确的车辆机动分类...")
+        
+        # 统计各种机动类型
+        maneuver_stats = {
+            "left_turn": [],
+            "right_turn": [],
+            "u_turn_or_complex_maneuver": [],
+            "straight_or_slight_curve": [],
+            "noisy_data": [],
+            "stationary_or_minimal_movement": [],
+            "complex_trajectory": [],
+            "other_maneuver": [],
+            "insufficient_data": []
+        }
+        
+        total_vehicles = len(self.raw_data['vehicle_id'].unique())
+        processed = 0
         
         for vehicle_id in self.raw_data['vehicle_id'].unique():
+            processed += 1
+            if processed % 200 == 0:
+                print(f"  已处理 {processed}/{total_vehicles} 辆车辆")
+            
             vehicle_data = self.raw_data[self.raw_data['vehicle_id'] == vehicle_id].copy()
             vehicle_data = vehicle_data.sort_values('frame_id')
             
-            if len(vehicle_data) < 10:  # 轨迹太短，跳过
+            if len(vehicle_data) < min_trajectory_length:
+                maneuver_stats["insufficient_data"].append(vehicle_id)
                 continue
             
-            # 计算航向角变化（基于位置变化计算）
-            if 'local_x' in vehicle_data.columns and 'local_y' in vehicle_data.columns:
-                dx = vehicle_data['local_x'].diff().fillna(0)
-                dy = vehicle_data['local_y'].diff().fillna(0)
-                headings = np.degrees(np.arctan2(dy, dx))
-                
-                if len(headings) > 1:
-                    heading_start = headings.iloc[1]  # 跳过第一个NaN值
-                    heading_end = headings.iloc[-1]
-                    heading_change = heading_end - heading_start
-                else:
-                    heading_change = 0
-            else:
-                heading_change = 0
-            
-            # 处理角度跨越问题
-            if heading_change > 180:
-                heading_change -= 360
-            elif heading_change < -180:
-                heading_change += 360
-            
-            # 判断是否为左转（航向角增加）
-            if heading_change > heading_threshold:
-                left_turn_vehicles.append(vehicle_id)
+            # 精确分类机动类型
+            maneuver_type = self.classify_vehicle_maneuver(vehicle_data)
+            maneuver_stats[maneuver_type].append(vehicle_id)
         
-        # 提取左转车辆数据
+        # 输出分类统计
+        print("=== 车辆机动分类统计 ===")
+        for maneuver_type, vehicles in maneuver_stats.items():
+            count = len(vehicles)
+            percentage = count / total_vehicles * 100
+            type_name = {
+                "left_turn": "真正左转",
+                "right_turn": "右转",
+                "u_turn_or_complex_maneuver": "掉头/复杂机动",
+                "straight_or_slight_curve": "直行/轻微弯曲",
+                "noisy_data": "数据噪声",
+                "stationary_or_minimal_movement": "静止/微小移动",
+                "complex_trajectory": "复杂轨迹",
+                "other_maneuver": "其他机动",
+                "insufficient_data": "数据不足"
+            }.get(maneuver_type, maneuver_type)
+            print(f"{type_name}: {count} 辆 ({percentage:.2f}%)")
+        
+        # 只提取真正的左转车辆
+        left_turn_vehicles = maneuver_stats["left_turn"]
         self.left_turn_data = self.raw_data[self.raw_data['vehicle_id'].isin(left_turn_vehicles)]
         
-        print(f"识别出 {len(left_turn_vehicles)} 辆左转车辆")
-        print(f"左转车辆占比: {len(left_turn_vehicles)/len(self.raw_data['vehicle_id'].unique())*100:.2f}%")
+        print(f"✅ 精确识别出 {len(left_turn_vehicles)} 辆真正的左转车辆")
+        print(f"左转车辆占比: {len(left_turn_vehicles)/total_vehicles*100:.2f}%")
+        
+        # 保存分类统计信息
+        self.maneuver_stats = maneuver_stats
         
         return True
+    
+    def clean_trajectory_data(self, vehicle_data):
+        """清洗轨迹数据，移除异常跳跃点"""
+        if len(vehicle_data) < 3:
+            return vehicle_data
+        
+        # 计算相邻点之间的距离
+        dx = vehicle_data['local_x'].diff().fillna(0)
+        dy = vehicle_data['local_y'].diff().fillna(0)
+        distances = np.sqrt(dx**2 + dy**2)
+        
+        # 移除距离异常大的点（可能是数据错误）
+        distance_threshold = distances.quantile(0.95) * 3  # 使用95分位数的3倍作为阈值
+        valid_indices = distances <= distance_threshold
+        valid_indices.iloc[0] = True  # 保留第一个点
+        
+        return vehicle_data[valid_indices].copy()
+    
+    def ultra_clean_trajectory(self, vehicle_data):
+        """超强轨迹清洗 - 5轮迭代清洗"""
+        if len(vehicle_data) < 10:
+            return vehicle_data
+        
+        clean_data = vehicle_data.copy()
+        
+        # 5轮超强清洗
+        for iteration in range(5):
+            if len(clean_data) < 10:
+                break
+            
+            # 计算相邻点距离
+            dx = clean_data['local_x'].diff().fillna(0)
+            dy = clean_data['local_y'].diff().fillna(0)
+            distances = np.sqrt(dx**2 + dy**2)
+            
+            # 使用四分位距方法检测异常
+            q25 = distances.quantile(0.25)
+            q75 = distances.quantile(0.75)
+            iqr = q75 - q25
+            
+            # 更严格的上界
+            upper_bound = q75 + 3 * iqr
+            lower_bound = q25 - 1.5 * iqr
+            
+            # 移除异常点
+            valid_mask = (distances >= lower_bound) & (distances <= upper_bound)
+            valid_mask.iloc[0] = True  # 保留第一个点
+            
+            new_clean_data = clean_data[valid_mask].copy()
+            
+            # 如果没有移除任何点，停止清洗
+            if len(new_clean_data) == len(clean_data):
+                break
+            
+            clean_data = new_clean_data
+        
+        return clean_data
+    
+    def classify_vehicle_maneuver(self, vehicle_data):
+        """精确分类车辆机动类型"""
+        if len(vehicle_data) < 20:
+            return "insufficient_data"
+        
+        # 超强清洗
+        clean_data = self.ultra_clean_trajectory(vehicle_data)
+        
+        if len(clean_data) < 20:
+            return "insufficient_data"
+        
+        x_coords = clean_data['local_x'].values
+        y_coords = clean_data['local_y'].values
+        
+        # 基本几何特征
+        start_x, start_y = x_coords[0], y_coords[0]
+        end_x, end_y = x_coords[-1], y_coords[-1]
+        
+        straight_distance = np.sqrt((end_x - start_x)**2 + (end_y - start_y)**2)
+        
+        # 计算路径长度
+        dx = np.diff(x_coords)
+        dy = np.diff(y_coords)
+        path_length = np.sum(np.sqrt(dx**2 + dy**2))
+        
+        # 曲率比
+        curvature_ratio = path_length / straight_distance if straight_distance > 0 else float('inf')
+        
+        # 空间跨度
+        x_range = x_coords.max() - x_coords.min()
+        y_range = y_coords.max() - y_coords.min()
+        max_span = max(x_range, y_range)
+        
+        # 计算总航向角变化
+        total_heading_change = self.calculate_total_heading_change(clean_data)
+        
+        # 分类逻辑
+        if curvature_ratio > 20:  # 路径长度是直线距离的20倍以上
+            return "noisy_data"
+        
+        if max_span < 15:  # 空间跨度小于15米
+            return "stationary_or_minimal_movement"
+        
+        if abs(total_heading_change) > 150:  # 总航向角变化超过150度
+            if straight_distance < 50:  # 净位移小于50米
+                return "u_turn_or_complex_maneuver"
+            else:
+                return "complex_trajectory"
+        
+        if 60 < abs(total_heading_change) < 120:  # 60-120度的转向
+            if straight_distance > 30 and curvature_ratio < 5:  # 有明显位移且路径相对平滑
+                if total_heading_change > 0:
+                    return "left_turn"
+                else:
+                    return "right_turn"
+        
+        if abs(total_heading_change) < 30:  # 航向角变化小于30度
+            return "straight_or_slight_curve"
+        
+        return "other_maneuver"
+    
+    def calculate_total_heading_change(self, vehicle_data):
+        """计算总航向角变化"""
+        if len(vehicle_data) < 3:
+            return 0
+        
+        x_coords = vehicle_data['local_x'].values
+        y_coords = vehicle_data['local_y'].values
+        
+        # 计算平滑的航向角
+        dx = np.diff(x_coords)
+        dy = np.diff(y_coords)
+        
+        # 使用较大的平滑窗口
+        window_size = min(15, len(dx) // 3)
+        if window_size >= 3:
+            dx_smooth = pd.Series(dx).rolling(window=window_size, center=True).mean().fillna(pd.Series(dx))
+            dy_smooth = pd.Series(dy).rolling(window=window_size, center=True).mean().fillna(pd.Series(dy))
+        else:
+            dx_smooth = pd.Series(dx)
+            dy_smooth = pd.Series(dy)
+        
+        headings = np.degrees(np.arctan2(dy_smooth, dx_smooth))
+        
+        # 计算累积航向角变化
+        heading_diffs = np.diff(headings)
+        
+        # 处理角度跨越
+        heading_diffs = np.where(heading_diffs > 180, heading_diffs - 360, heading_diffs)
+        heading_diffs = np.where(heading_diffs < -180, heading_diffs + 360, heading_diffs)
+        
+        # 返回累积变化
+        return np.sum(heading_diffs)
+    
+    def detect_left_turn_pattern(self, vehicle_data, heading_threshold):
+        """
+        改进的左转模式检测
+        
+        Args:
+            vehicle_data: 清洗后的车辆轨迹数据
+            heading_threshold: 航向角变化阈值
+            
+        Returns:
+            bool: 是否为左转
+        """
+        if len(vehicle_data) < 10:
+            return False
+        
+        # 进一步清洗数据 - 使用更严格的标准
+        clean_data = self.aggressive_clean_trajectory(vehicle_data)
+        
+        if len(clean_data) < 10:
+            return False
+        
+        # 计算轨迹的几何特征
+        geometry_check = self.check_trajectory_geometry(clean_data)
+        if not geometry_check:
+            return False
+        
+        # 基于分段分析的左转检测
+        segment_analysis = self.analyze_trajectory_segments(clean_data)
+        
+        # 计算累积转向
+        cumulative_turn = self.calculate_smooth_cumulative_turn(clean_data)
+        
+        # 多重验证条件
+        conditions = {
+            'max_left_turn': np.max(cumulative_turn) > heading_threshold,
+            'final_turn': cumulative_turn.iloc[-1] > heading_threshold * 0.7,
+            'consistent_turn': segment_analysis['consistent_left_turn'],
+            'geometry_valid': geometry_check,
+            'turn_smoothness': np.std(cumulative_turn) > 15
+        }
+        
+        # 至少满足4个条件才认为是左转
+        valid_conditions = sum(conditions.values())
+        is_left_turn = valid_conditions >= 4
+        
+        return is_left_turn
+    
+    def aggressive_clean_trajectory(self, vehicle_data):
+        """更激进的轨迹清洗"""
+        if len(vehicle_data) < 5:
+            return vehicle_data
+        
+        clean_data = vehicle_data.copy()
+        
+        # 多轮清洗
+        for iteration in range(3):  # 最多3轮清洗
+            if len(clean_data) < 5:
+                break
+                
+            # 计算相邻点距离
+            dx = clean_data['local_x'].diff().fillna(0)
+            dy = clean_data['local_y'].diff().fillna(0)
+            distances = np.sqrt(dx**2 + dy**2)
+            
+            # 使用更严格的阈值
+            median_distance = distances.median()
+            mad = np.median(np.abs(distances - median_distance))  # 中位数绝对偏差
+            threshold = median_distance + 5 * mad  # 更严格的阈值
+            
+            # 移除异常点
+            valid_indices = distances <= threshold
+            valid_indices.iloc[0] = True  # 保留第一个点
+            
+            new_clean_data = clean_data[valid_indices].copy()
+            
+            # 如果没有移除任何点，停止清洗
+            if len(new_clean_data) == len(clean_data):
+                break
+                
+            clean_data = new_clean_data
+        
+        return clean_data
+    
+    def check_trajectory_geometry(self, vehicle_data):
+        """检查轨迹几何特征的合理性"""
+        if len(vehicle_data) < 5:
+            return False
+        
+        x_coords = vehicle_data['local_x'].values
+        y_coords = vehicle_data['local_y'].values
+        
+        # 计算直线距离和路径长度
+        straight_distance = np.sqrt((x_coords[-1] - x_coords[0])**2 + (y_coords[-1] - y_coords[0])**2)
+        
+        dx = np.diff(x_coords)
+        dy = np.diff(y_coords)
+        path_length = np.sum(np.sqrt(dx**2 + dy**2))
+        
+        # 曲率比检查
+        if straight_distance > 0:
+            curvature_ratio = path_length / straight_distance
+            # 对于真实的左转，曲率比应该在合理范围内
+            if curvature_ratio > 50:  # 如果路径长度是直线距离的50倍以上，可能是噪声
+                return False
+        
+        # 检查轨迹是否有明显的空间变化
+        x_range = x_coords.max() - x_coords.min()
+        y_range = y_coords.max() - y_coords.min()
+        
+        # 轨迹应该有一定的空间跨度
+        if max(x_range, y_range) < 10:  # 小于10米的变化可能不是真正的转向
+            return False
+        
+        return True
+    
+    def analyze_trajectory_segments(self, vehicle_data):
+        """分段分析轨迹"""
+        if len(vehicle_data) < 20:
+            return {'consistent_left_turn': False}
+        
+        x_coords = vehicle_data['local_x'].values
+        y_coords = vehicle_data['local_y'].values
+        
+        # 将轨迹分成5段
+        n_segments = 5
+        segment_size = len(x_coords) // n_segments
+        
+        segment_directions = []
+        for i in range(n_segments):
+            start_idx = i * segment_size
+            end_idx = min((i + 1) * segment_size, len(x_coords))
+            
+            if end_idx - start_idx < 3:
+                continue
+            
+            # 计算段的主方向
+            dx_seg = x_coords[end_idx-1] - x_coords[start_idx]
+            dy_seg = y_coords[end_idx-1] - y_coords[start_idx]
+            
+            if dx_seg == 0 and dy_seg == 0:
+                continue
+            
+            direction = np.degrees(np.arctan2(dy_seg, dx_seg))
+            segment_directions.append(direction)
+        
+        if len(segment_directions) < 3:
+            return {'consistent_left_turn': False}
+        
+        # 计算方向变化
+        direction_changes = []
+        for i in range(1, len(segment_directions)):
+            change = segment_directions[i] - segment_directions[i-1]
+            # 标准化角度
+            while change > 180:
+                change -= 360
+            while change < -180:
+                change += 360
+            direction_changes.append(change)
+        
+        # 检查是否有一致的左转趋势
+        left_turns = [change for change in direction_changes if change > 10]  # 大于10度的左转
+        total_left_turn = sum(left_turns)
+        
+        consistent_left_turn = (len(left_turns) >= len(direction_changes) * 0.6 and 
+                               total_left_turn > 30)
+        
+        return {'consistent_left_turn': consistent_left_turn}
+    
+    def calculate_smooth_cumulative_turn(self, vehicle_data):
+        """计算平滑的累积转向"""
+        if len(vehicle_data) < 3:
+            return pd.Series([0])
+        
+        x_coords = vehicle_data['local_x'].values
+        y_coords = vehicle_data['local_y'].values
+        
+        # 计算移动方向
+        dx = np.diff(x_coords)
+        dy = np.diff(y_coords)
+        
+        # 使用更大的平滑窗口
+        window_size = min(10, len(dx) // 3)
+        if window_size >= 3:
+            dx_smooth = pd.Series(dx).rolling(window=window_size, center=True).mean().fillna(pd.Series(dx))
+            dy_smooth = pd.Series(dy).rolling(window=window_size, center=True).mean().fillna(pd.Series(dy))
+        else:
+            dx_smooth = pd.Series(dx)
+            dy_smooth = pd.Series(dy)
+        
+        # 计算航向角
+        headings = np.degrees(np.arctan2(dy_smooth, dx_smooth))
+        
+        # 计算累积转向
+        return self.calculate_cumulative_turn(headings)
+    
+    def calculate_cumulative_turn(self, headings):
+        """计算累积转向角度"""
+        if len(headings) < 2:
+            return pd.Series([0])
+        
+        # 计算相邻航向角的差异
+        heading_diffs = headings.diff().fillna(0)
+        
+        # 处理角度跨越问题
+        heading_diffs = heading_diffs.apply(lambda x: self.normalize_angle(x))
+        
+        # 计算累积转向（正值表示左转，负值表示右转）
+        cumulative_turn = heading_diffs.cumsum()
+        
+        return cumulative_turn
+    
+    def normalize_angle(self, angle):
+        """标准化角度到[-180, 180]范围"""
+        while angle > 180:
+            angle -= 360
+        while angle < -180:
+            angle += 360
+        return angle
+    
+    def calculate_heading_change(self, vehicle_data):
+        """
+        计算车辆的航向角变化
+        
+        Args:
+            vehicle_data: 单个车辆的轨迹数据
+            
+        Returns:
+            float: 航向角变化（度）
+        """
+        if len(vehicle_data) < 2:
+            return 0
+        
+        # 基于位置变化计算航向角
+        dx = vehicle_data['local_x'].diff().fillna(0)
+        dy = vehicle_data['local_y'].diff().fillna(0)
+        headings = np.degrees(np.arctan2(dy, dx))
+        
+        if len(headings) > 1:
+            heading_start = headings.iloc[1]  # 跳过第一个NaN值
+            heading_end = headings.iloc[-1]
+            heading_change = heading_end - heading_start
+        else:
+            heading_change = 0
+        
+        # 处理角度跨越问题
+        if heading_change > 180:
+            heading_change -= 360
+        elif heading_change < -180:
+            heading_change += 360
+            
+        return abs(heading_change)
     
     def select_sample_vehicles(self, num_samples=5):
         """选择代表性的左转车辆样例"""
@@ -147,7 +571,7 @@ class LeftTurnAnalyzer:
         
         features = {}
         for vehicle_id in vehicle_ids:
-            vehicle_data = self.left_turn_data[self.left_turn_data['Vehicle_ID'] == vehicle_id]
+            vehicle_data = self.left_turn_data[self.left_turn_data['vehicle_id'] == vehicle_id]
             if len(vehicle_data) == 0:
                 continue
                 
@@ -156,9 +580,9 @@ class LeftTurnAnalyzer:
                 'trajectory_length': len(vehicle_data),
                 'avg_speed': vehicle_data['v_Vel'].mean(),
                 'max_speed': vehicle_data['v_Vel'].max(),
-                'start_position': (vehicle_data.iloc[0]['Local_X'], vehicle_data.iloc[0]['Local_Y']),
-                'end_position': (vehicle_data.iloc[-1]['Local_X'], vehicle_data.iloc[-1]['Local_Y']),
-                'heading_change': abs(vehicle_data['Heading'].iloc[-1] - vehicle_data['Heading'].iloc[0])
+                'start_position': (vehicle_data.iloc[0]['local_x'], vehicle_data.iloc[0]['local_y']),
+                'end_position': (vehicle_data.iloc[-1]['local_x'], vehicle_data.iloc[-1]['local_y']),
+                'heading_change': self.calculate_heading_change(vehicle_data)
             }
         
         return features
@@ -381,9 +805,9 @@ class LeftTurnAnalyzer:
             f.write("1. 数据概览\n")
             f.write("-" * 30 + "\n")
             f.write(f"数据文件: {self.data_path}\n")
-            f.write(f"总车辆数: {len(self.raw_data['Vehicle_ID'].unique())}\n")
-            f.write(f"左转车辆数: {len(self.left_turn_data['Vehicle_ID'].unique())}\n")
-            f.write(f"左转车辆占比: {len(self.left_turn_data['Vehicle_ID'].unique())/len(self.raw_data['Vehicle_ID'].unique())*100:.2f}%\n")
+            f.write(f"总车辆数: {len(self.raw_data['vehicle_id'].unique())}\n")
+            f.write(f"左转车辆数: {len(self.left_turn_data['vehicle_id'].unique())}\n")
+            f.write(f"左转车辆占比: {len(self.left_turn_data['vehicle_id'].unique())/len(self.raw_data['vehicle_id'].unique())*100:.2f}%\n")
             f.write(f"分析样例数: {len(self.sample_vehicles)}\n\n")
             
             f.write("2. 样例车辆详细特征\n")
@@ -473,9 +897,9 @@ class LeftTurnAnalyzer:
 def main():
     """主函数"""
     # 数据文件路径
-    data_path = input("请输入NGSIM数据文件路径 (默认: data/peachtree_filtered_data.csv): ").strip()
+    data_path = input("请输入NGSIM数据文件路径 (默认: ../data/peachtree_filtered_data.csv): ").strip()
     if not data_path:
-        data_path = "data/peachtree_filtered_data.csv"
+        data_path = "../data/peachtree_filtered_data.csv"
     
     # 检查文件是否存在
     if not os.path.exists(data_path):
