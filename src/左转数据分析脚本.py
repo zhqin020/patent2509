@@ -69,7 +69,9 @@ class LeftTurnAnalyzer:
             "stationary_or_minimal_movement": [],
             "complex_trajectory": [],
             "other_maneuver": [],
-            "insufficient_data": []
+            "insufficient_data": [],
+            "out_of_intersection_range": [],
+            "excessive_trajectory_span": []
         }
         
         total_vehicles = len(self.raw_data['vehicle_id'].unique())
@@ -105,7 +107,9 @@ class LeftTurnAnalyzer:
                 "stationary_or_minimal_movement": "静止/微小移动",
                 "complex_trajectory": "复杂轨迹",
                 "other_maneuver": "其他机动",
-                "insufficient_data": "数据不足"
+                "insufficient_data": "数据不足",
+                "out_of_intersection_range": "超出路口范围",
+                "excessive_trajectory_span": "轨迹跨度过大"
             }.get(maneuver_type, maneuver_type)
             print(f"{type_name}: {count} 辆 ({percentage:.2f}%)")
         
@@ -214,6 +218,11 @@ class LeftTurnAnalyzer:
         # 计算总航向角变化
         total_heading_change = self.calculate_total_heading_change(clean_data)
         
+        # 路口空间约束检查
+        intersection_constraint_result = self.check_intersection_spatial_constraints(clean_data)
+        if intersection_constraint_result != "valid":
+            return intersection_constraint_result
+        
         # 分类逻辑
         if curvature_ratio > 20:  # 路径长度是直线距离的20倍以上
             return "noisy_data"
@@ -238,6 +247,44 @@ class LeftTurnAnalyzer:
             return "straight_or_slight_curve"
         
         return "other_maneuver"
+    
+    def check_intersection_spatial_constraints(self, vehicle_data):
+        """检查路口空间约束"""
+        if len(vehicle_data) < 10:
+            return "insufficient_data"
+        
+        x_coords = vehicle_data['local_x'].values
+        y_coords = vehicle_data['local_y'].values
+        
+        # 计算轨迹的几何中心（转角顶点的近似位置）
+        center_x = np.mean(x_coords)
+        center_y = np.mean(y_coords)
+        
+        # 计算所有点到中心的距离
+        distances_to_center = np.sqrt((x_coords - center_x)**2 + (y_coords - center_y)**2)
+        max_distance_to_center = np.max(distances_to_center)
+        
+        # 计算起止点距离
+        start_x, start_y = x_coords[0], y_coords[0]
+        end_x, end_y = x_coords[-1], y_coords[-1]
+        start_end_distance = np.sqrt((end_x - start_x)**2 + (end_y - start_y)**2)
+        
+        # 路口空间约束条件
+        MAX_DISTANCE_TO_CENTER = 200  # 与转角顶点最大距离200米
+        MAX_START_END_DISTANCE = 300  # 起止点最大距离300米
+        
+        # 检查约束条件
+        if max_distance_to_center > MAX_DISTANCE_TO_CENTER:
+            print(f"    ❌ 轨迹超出路口范围: 最大距离中心 {max_distance_to_center:.1f}m > {MAX_DISTANCE_TO_CENTER}m")
+            return "out_of_intersection_range"
+        
+        if start_end_distance > MAX_START_END_DISTANCE:
+            print(f"    ❌ 起止点距离过大: {start_end_distance:.1f}m > {MAX_START_END_DISTANCE}m")
+            return "excessive_trajectory_span"
+        
+        # 通过空间约束检查
+        print(f"    ✅ 空间约束检查通过: 最大距离中心 {max_distance_to_center:.1f}m, 起止距离 {start_end_distance:.1f}m")
+        return "valid"
     
     def calculate_total_heading_change(self, vehicle_data):
         """计算总航向角变化"""
