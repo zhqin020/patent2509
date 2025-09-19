@@ -903,6 +903,119 @@ class LeftTurnAnalyzer:
         
         print(f"详细分析报告已保存到: {report_path}")
     
+    def export_processed_data(self, output_dir='left_turn_analysis'):
+        """导出预处理后的左转数据，供深度学习框架使用"""
+        if self.left_turn_data is None or len(self.left_turn_data) == 0:
+            print("没有左转数据可导出")
+            return False
+        
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # 导出完整的左转数据
+        export_path = os.path.join(output_dir, 'processed_left_turn_data.csv')
+        
+        # 添加质量标记和特征
+        export_data = self.left_turn_data.copy()
+        
+        # 为每个车辆添加质量评估
+        vehicle_quality = {}
+        for vehicle_id in export_data['vehicle_id'].unique():
+            vehicle_data = export_data[export_data['vehicle_id'] == vehicle_id]
+            
+            # 计算数据质量指标
+            trajectory_length = len(vehicle_data)
+            x_coords = vehicle_data['local_x'].values
+            y_coords = vehicle_data['local_y'].values
+            
+            # 计算轨迹平滑度
+            dx = np.diff(x_coords)
+            dy = np.diff(y_coords)
+            distances = np.sqrt(dx**2 + dy**2)
+            smoothness = np.std(distances) if len(distances) > 0 else 0
+            
+            # 计算总航向角变化
+            total_heading_change = self.calculate_total_heading_change(vehicle_data)
+            
+            # 计算空间跨度
+            x_range = x_coords.max() - x_coords.min()
+            y_range = y_coords.max() - y_coords.min()
+            spatial_span = max(x_range, y_range)
+            
+            vehicle_quality[vehicle_id] = {
+                'trajectory_length': trajectory_length,
+                'smoothness': smoothness,
+                'total_heading_change': abs(total_heading_change),
+                'spatial_span': spatial_span,
+                'is_high_quality': (
+                    trajectory_length >= 50 and 
+                    smoothness < 10 and 
+                    60 <= abs(total_heading_change) <= 120 and
+                    spatial_span < 200
+                )
+            }
+        
+        # 添加质量标记到导出数据
+        export_data['is_high_quality'] = export_data['vehicle_id'].map(
+            lambda x: vehicle_quality[x]['is_high_quality']
+        )
+        export_data['trajectory_length'] = export_data['vehicle_id'].map(
+            lambda x: vehicle_quality[x]['trajectory_length']
+        )
+        export_data['smoothness'] = export_data['vehicle_id'].map(
+            lambda x: vehicle_quality[x]['smoothness']
+        )
+        export_data['total_heading_change'] = export_data['vehicle_id'].map(
+            lambda x: vehicle_quality[x]['total_heading_change']
+        )
+        export_data['spatial_span'] = export_data['vehicle_id'].map(
+            lambda x: vehicle_quality[x]['spatial_span']
+        )
+        
+        # 保存数据
+        export_data.to_csv(export_path, index=False)
+        
+        # 统计信息
+        total_vehicles = len(export_data['vehicle_id'].unique())
+        high_quality_vehicles = len([v for v in vehicle_quality.values() if v['is_high_quality']])
+        
+        print(f"{'='*50}")
+        print("数据导出完成！")
+        print(f"导出文件: {export_path}")
+        print(f"总车辆数: {total_vehicles}")
+        print(f"高质量车辆数: {high_quality_vehicles} ({high_quality_vehicles/total_vehicles*100:.1f}%)")
+        print(f"总数据点: {len(export_data)}")
+        print("="*50)
+        
+        # 保存质量统计报告
+        quality_report_path = os.path.join(output_dir, 'data_quality_report.txt')
+        with open(quality_report_path, 'w', encoding='utf-8') as f:
+            f.write("左转数据质量报告")
+            f.write("="*50 + "")
+            f.write(f"总车辆数: {total_vehicles}")
+            f.write(f"高质量车辆数: {high_quality_vehicles}")
+            f.write(f"高质量比例: {high_quality_vehicles/total_vehicles*100:.1f}%")
+            f.write(f"总数据点: {len(export_data)}")
+            
+            f.write("质量标准:")
+            f.write("- 轨迹长度 >= 50 个点")
+            f.write("- 轨迹平滑度 < 10")
+            f.write("- 航向角变化 60°-120°")
+            f.write("- 空间跨度 < 200米")
+            
+            f.write("导出数据列说明:")
+            f.write("- vehicle_id: 车辆ID")
+            f.write("- frame_id: 帧ID")
+            f.write("- local_x, local_y: 车辆坐标")
+            f.write("- is_high_quality: 是否为高质量数据")
+            f.write("- trajectory_length: 轨迹长度")
+            f.write("- smoothness: 轨迹平滑度")
+            f.write("- total_heading_change: 总航向角变化")
+            f.write("- spatial_span: 空间跨度")
+        
+        print(f"质量报告已保存到: {quality_report_path}")
+        return True
+    
     def run_complete_analysis(self, num_samples=5, output_dir='left_turn_analysis'):
         """运行完整的左转数据分析流程"""
         print("开始左转车辆数据筛选和轨迹分析...")

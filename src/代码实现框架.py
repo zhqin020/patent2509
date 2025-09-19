@@ -52,14 +52,31 @@ class MultiModalDataset(Dataset):
         self.data = self.load_data()
         
     def load_data(self):
-        """加载和预处理数据"""
-        # 加载NGSIM数据或自定义数据
+        """加载预处理好的左转数据"""
+        print(f"正在加载预处理数据: {self.data_path}")
+        
+        # 加载由数据预处理管道生成的数据
         data = pd.read_csv(self.data_path)
         
-        # 数据预处理
-        processed_data = self.preprocess_data(data)
+        print(f"数据加载成功: {len(data)} 条记录, {len(data['vehicle_id'].unique())} 辆车")
         
-        return processed_data
+        # 检查是否包含必要的列
+        required_columns = ['vehicle_id', 'frame_id', 'local_x', 'local_y']
+        missing_columns = [col for col in required_columns if col not in data.columns]
+        if missing_columns:
+            raise ValueError(f"数据缺少必要列: {missing_columns}")
+        
+        # 如果有质量标记，优先使用高质量数据
+        if 'is_high_quality' in data.columns:
+            high_quality_data = data[data['is_high_quality'] == True]
+            if len(high_quality_data) > 0:
+                print(f"使用高质量数据: {len(high_quality_data)} 条记录, {len(high_quality_data['vehicle_id'].unique())} 辆车")
+                data = high_quality_data
+        
+        # 按车辆ID和帧ID排序
+        data = data.sort_values(['vehicle_id', 'frame_id'])
+        
+        return data
     
     def preprocess_data(self, data):
         """数据预处理"""
@@ -115,19 +132,35 @@ class MultiModalDataset(Dataset):
     
     def __getitem__(self, idx):
         """获取单个样本"""
-        # 历史轨迹
-        history = self.data.iloc[idx:idx+self.sequence_length]
+        # 获取车辆序列数据
+        vehicle_ids = self.data['vehicle_id'].unique()
         
-        # 未来轨迹
-        future = self.data.iloc[idx+self.sequence_length:idx+self.sequence_length+self.prediction_length]
-        
-        # 提取多模态特征
-        visual_features = self.extract_visual_features(history)
-        motion_features = self.extract_motion_features(history)
-        traffic_features = self.extract_traffic_features(history)
-        
-        # 左转意图标签
-        left_turn_intent = self.get_left_turn_intent(future)
+        # 简化处理：按索引获取车辆数据
+        if idx < len(vehicle_ids):
+            vehicle_id = vehicle_ids[idx]
+            vehicle_data = self.data[self.data['vehicle_id'] == vehicle_id]
+            
+            # 确保有足够的数据点
+            if len(vehicle_data) < self.sequence_length + self.prediction_length:
+                # 如果数据不足，使用填充或跳过
+                vehicle_data = vehicle_data.iloc[:self.sequence_length + self.prediction_length]
+            
+            # 历史轨迹
+            history = vehicle_data.iloc[:self.sequence_length]
+            
+            # 未来轨迹
+            future = vehicle_data.iloc[self.sequence_length:self.sequence_length + self.prediction_length]
+            
+            # 提取多模态特征
+            visual_features = self.extract_visual_features(history)
+            motion_features = self.extract_motion_features(history)
+            traffic_features = self.extract_traffic_features(history)
+            
+            # 左转意图标签（从预处理数据中获取）
+            left_turn_intent = self.get_left_turn_intent(vehicle_data)
+        else:
+            # 索引超出范围，返回默认数据
+            return self.__getitem__(idx % len(vehicle_ids))
         
         # 目标轨迹（使用NGSIM数据的local_x, local_y列）
         if 'local_x' in future.columns and 'local_y' in future.columns:
@@ -201,33 +234,15 @@ class MultiModalDataset(Dataset):
             
         return np.array(features)
     
-    def get_left_turn_intent(self, future):
-        """判断左转意图"""
-        # 基于未来轨迹判断是否为左转
-        if 'local_x' in future.columns and 'local_y' in future.columns:
-            # 计算轨迹的航向角变化
-            dx = future['local_x'].diff().fillna(0)
-            dy = future['local_y'].diff().fillna(0)
-            
-            if len(dx) > 1 and len(dy) > 1:
-                start_heading = np.arctan2(dy.iloc[1], dx.iloc[1])
-                end_heading = np.arctan2(dy.iloc[-1], dx.iloc[-1])
-                
-                heading_change = end_heading - start_heading
-                
-                # 标准化角度到[-π, π]
-                while heading_change > np.pi:
-                    heading_change -= 2 * np.pi
-                while heading_change < -np.pi:
-                    heading_change += 2 * np.pi
-                
-                # 如果航向角变化大于阈值，认为是左转
-                return 1.0 if heading_change > np.pi/6 else 0.0
-            else:
-                return 0.0
+    def get_left_turn_intent(self, vehicle_data):
+        """从预处理数据中获取左转意图标签"""
+        # 直接从预处理数据中读取is_high_quality标记
+        # 预处理管道已经完成了精确的左转识别
+        if 'is_high_quality' in vehicle_data.columns:
+            return 1.0 if vehicle_data['is_high_quality'].iloc[0] else 0.0
         else:
-            # 如果没有位置数据，返回随机值
-            return np.random.choice([0.0, 1.0])
+            # 兼容性处理：如果没有质量标记，默认为左转数据
+            return 1.0
 
 class VisualEncoder(nn.Module):
     """视觉特征编码器"""
@@ -817,19 +832,51 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
     
-    # 创建模拟数据集（实际使用时替换为真实数据）
+    # 获取预处理数据路径
+    processed_data_path = input("请输入预处理数据路径 (默认: processed_data/processed_left_turn_data.csv): ").strip()
+    if not processed_data_path:
+        processed_data_path = "processed_data/processed_left_turn_data.csv"
+    
+    # 检查预处理数据是否存在
+    import os
+    if not os.path.exists(processed_data_path):
+        print(f"❌ 预处理数据不存在: {processed_data_path}")
+        print("💡 请先运行 数据预处理管道.py 生成预处理数据")
+        print("   或者使用原始数据路径（不推荐，因为没有精确的左转识别）")
+        
+        use_raw = input("是否使用原始数据？(y/N): ").strip().lower()
+        if use_raw == 'y':
+            processed_data_path = '../data/peachtree_filtered_data.csv'
+            print("⚠️  警告: 使用原始数据可能包含非左转车辆")
+        else:
+            print("请先运行数据预处理管道")
+            return
+    
+    # 创建数据集
     print("创建数据集...")
-    data_path = '../data/peachtree_filtered_data.csv'
-    
-    # 这里应该使用真实的数据路径
-    train_dataset = MultiModalDataset(data_path=data_path)
-    val_dataset = MultiModalDataset(data_path)
-    test_dataset = MultiModalDataset(data_path)
-    
-    # 为演示创建模拟数据
-    #train_dataset = MockDataset(800)
-    #val_dataset = MockDataset(200)
-    #test_dataset = MockDataset(200)
+    try:
+        # 使用预处理好的高质量左转数据
+        full_dataset = MultiModalDataset(data_path=processed_data_path)
+        
+        # 数据集划分
+        dataset_size = len(full_dataset)
+        train_size = int(0.7 * dataset_size)
+        val_size = int(0.15 * dataset_size)
+        test_size = dataset_size - train_size - val_size
+        
+        print(f"数据集大小: 训练={train_size}, 验证={val_size}, 测试={test_size}")
+        
+        # 简单划分（实际应用中可能需要更复杂的划分策略）
+        train_dataset = torch.utils.data.Subset(full_dataset, range(train_size))
+        val_dataset = torch.utils.data.Subset(full_dataset, range(train_size, train_size + val_size))
+        test_dataset = torch.utils.data.Subset(full_dataset, range(train_size + val_size, dataset_size))
+        
+    except Exception as e:
+        print(f"❌ 数据加载失败: {e}")
+        print("🔄 使用模拟数据进行演示...")
+        train_dataset = MockDataset(800)
+        val_dataset = MockDataset(200)
+        test_dataset = MockDataset(200)
     
     # 创建数据加载器
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
