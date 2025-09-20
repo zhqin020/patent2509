@@ -1,4 +1,4 @@
-问题1： 如果NGSIM数据已经包含了movement=2(左转),  这个数据集是否还能用于左转预测？
+# 问题1： 如果NGSIM数据已经包含了movement=2(左转),  这个数据集是否还能用于左转预测？
 
 回答：
 是的，即使NGSIM Peachtree Street数据集已经包含了`movement=2`（左转）标签，仍然可以用于左转预测任务，但需要明确预测的目标和方法。以下是分析和实现思路，结合数据集结构（包含`vehicle_id`, `frame_id`, `local_x`, `local_y`, `v_vel`, `int_id`, `movement`等字段）。
@@ -112,7 +112,7 @@ NGSIM Peachtree Street数据集因包含`movement=2`标签，非常适合左转�
 
 
 
-问题2： 下面是实际的数据样例：
+# 问题2： 下面是实际的数据样例：
  {"vehicle_id":"352","frame_id":"3380","total_frames":"1156","global_time":"1163368300","local_x":"-5.359","local_y":"0","global_x":"2230502.921","global_y":"1375532.938","v_length":"15","v_width":"6.5","v_class":"2","v_vel":"33.96","v_acc":"0","lane_id":"1","o_zone":"121","d_zone":"201","int_id":"0","section_id":"1","direction":"4","movement":"1","preceding":"0","following":"455","space_headway":"0","time_headway":"0","location":"peachtree"} ,{"vehicle_id":"352","frame_id":"3379","total_frames":"1156","global_time":"1163368200","local_x":"-4.623","local_y":"4.566","global_x":"2230503.114","global_y":"1375537.934","v_length":"15","v_width":"6.5","v_class":"2","v_vel":"33.96","v_acc":"0","lane_id":"1","o_zone":"121","d_zone":"201","int_id":"0","section_id":"1","direction":"4","movement":"1","preceding":"0","following":"455","space_headway":"0","time_headway":"0","location":"peachtree"}
  数据是否还能适合进行模型创建和车辆左转预测分析？ int_id 是路口标识，是否只能用同一个路口进行训练，多个路口的数据会不会导致模型失败
 
@@ -196,4 +196,77 @@ NGSIM Peachtree Street数据集因包含`movement=2`标签，非常适合左转�
 * **不一定只能用同一个路口训练**，但如果直接混合多个 int\_id 的原始数据，模型确实可能失败。
 * 如果你要跨路口泛化，必须做 **几何归一化** + **相对特征**，或者在模型里显式引入路口信息。
 
- 
+
+
+ # 问题3：如何区分NGSIM 数据中，在一个路口的一个入口的行驶记录
+
+ 回答：
+ 这是个非常关键的问题 👍。在 NGSIM 数据中，如果你想区分 **“在一个路口的某个入口（进口道）行驶的车辆轨迹”**，通常需要结合多个字段来使用：
+
+---
+
+### 1. `Int_ID`
+
+* 表示车辆是否处于某个 **路口区域**，以及是哪个路口。
+* 如果 `Int_ID > 0`，说明车辆在某个路口（如 Int\_ID=2 就是第二个路口）。
+
+---
+
+### 2. `Direction`
+
+* 表示车辆的 **行驶方向**：
+
+  * 1 = Eastbound (EB)
+  * 2 = Northbound (NB)
+  * 3 = Westbound (WB)
+  * 4 = Southbound (SB)
+* 这能区分车辆是从哪个方向驶入路口的。
+
+---
+
+### 3. `Lane_ID`
+
+* 表示车辆在该方向上的 **具体车道编号**。
+* 普通直行/右行车道按从左到右编号，左转车道单独编号（通常从 11 开始）。
+* 利用 `Lane_ID` 可以区分不同进口的车道情况，比如：直行车道 vs 左转车道。
+
+---
+
+### 4. `Movement`
+
+* 表示车辆在路口的 **转向类型**：
+
+  * 1 = Through (直行)
+  * 2 = Left-turn (左转)
+  * 3 = Right-turn (右转)
+
+---
+
+✅ **综合用法**：
+如果你想筛选某个路口某个入口的车辆，可以用下面的逻辑：
+
+```
+条件 = (Int_ID = 某路口编号)
+     AND (Direction = 某方向)
+     AND (Lane_ID = 某个车道编号)
+```
+
+然后再结合 `Movement` 来区分这些车是直行、左转还是右转。
+
+---
+
+📌 举个例子：
+假设你要找 **路口 2，北进口的左转车辆**，筛选条件可以是：
+
+```
+Int_ID = 2
+Direction = 2  (Northbound)
+Lane_ID = 11 或以上 (左转车道)
+Movement = 2 (Left-turn)
+```
+
+这样就能准确地锁定 **在路口 2 北进口左转的车辆轨迹**。
+
+---
+
+要不要我帮你写一段 **Python 数据筛选示例代码（基于 pandas）**，直接在 NGSIM 轨迹表里筛出“某个路口某个进口的车辆记录”？

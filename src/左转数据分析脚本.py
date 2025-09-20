@@ -2,15 +2,17 @@
 """
 左转车辆数据筛选和轨迹分析脚本
 用于详细分析左转车辆的特征和轨迹，输出可视化结果
+集成精确机动分类与空间约束，支持多路口参数配置
+解决问题3：如何区分NGSIM数据中，在一个路口的一个入口的行驶记录
 """
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import seaborn as sns
+# import seaborn as sns  # 注释掉可选依赖
 import os
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -19,1006 +21,1033 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 class LeftTurnAnalyzer:
-    """左转车辆分析器"""
+    """左转车辆分析器 - 集成精确机动分类与多路口支持"""
     
-    def __init__(self, data_path: str):
+    def __init__(self, data_path: str, intersection_id: Optional[int] = None, entrance_direction: Optional[int] = None, entrance_lane: Optional[int] = None):
         """
         初始化分析器
         
         Args:
             data_path: NGSIM数据文件路径
+            intersection_id: 路口ID (1, 2, 3, 4等)，None表示稍后选择
+            entrance_direction: 入口方向 (1=东向, 2=北向, 3=西向, 4=南向)
+            entrance_lane: 入口车道ID
         """
         self.data_path = data_path
+        self.intersection_id = intersection_id
+        self.entrance_direction = entrance_direction
+        self.entrance_lane = entrance_lane
         self.raw_data = None
         self.left_turn_data = None
         self.sample_vehicles = []
+        self.maneuver_classification = {}
+        self.entrance_analysis = {}
+        self.intersection_data = {}
+        self.selected_entrance = None
+        self.intersections = {}
+        self.selected_intersection = None
+        self.selected_entrance_key = None
+        self.sample_features = None
         
-    def load_data(self):
-        """加载数据"""
-        try:
-            print(f"正在加载数据: {self.data_path}")
-            self.raw_data = pd.read_csv(self.data_path)
-            print(f"数据加载成功，共 {len(self.raw_data)} 条记录")
-            print(f"包含 {len(self.raw_data['vehicle_id'].unique())} 辆车辆")
-            return True
-        except Exception as e:
-            print(f"数据加载失败: {e}")
-            return False
-    
-    def identify_left_turn_vehicles(self, heading_threshold=75, min_trajectory_length=100):
-        """
-        精确的左转车辆识别算法 - 区分左转、掉头、复杂机动
-        
-        Args:
-            heading_threshold: 航向角变化阈值（度，默认75度）
-            min_trajectory_length: 最小轨迹长度（默认100个点）
-        """
-        if self.raw_data is None:
-            print("请先加载数据")
-            return False
-        
-        print("正在进行精确的车辆机动分类...")
-        
-        # 统计各种机动类型
-        maneuver_stats = {
-            "left_turn": [],
-            "right_turn": [],
-            "u_turn_or_complex_maneuver": [],
-            "straight_or_slight_curve": [],
-            "noisy_data": [],
-            "stationary_or_minimal_movement": [],
-            "complex_trajectory": [],
-            "other_maneuver": [],
-            "insufficient_data": [],
-            "out_of_intersection_range": [],
-            "excessive_trajectory_span": []
+        # 方向映射
+        self.direction_names = {
+            1: "东向 (Eastbound)",
+            2: "北向 (Northbound)", 
+            3: "西向 (Westbound)",
+            4: "南向 (Southbound)"
         }
         
-        total_vehicles = len(self.raw_data['vehicle_id'].unique())
-        processed = 0
+        # 机动类型映射
+        self.movement_names = {
+            1: "直行 (Through)",
+            2: "左转 (Left Turn)",
+            3: "右转 (Right Turn)",
+            4: "掉头 (U-Turn)"
+        }
         
-        for vehicle_id in self.raw_data['vehicle_id'].unique():
-            processed += 1
-            if processed % 200 == 0:
-                print(f"  已处理 {processed}/{total_vehicles} 辆车辆")
+        # 根据路口ID设置参数
+        self.setup_intersection_parameters()
+    
+    def setup_intersection_parameters(self):
+        """根据路口ID设置分析参数"""
+        if self.intersection_id is None:
+            # 如果还没有选择路口，使用默认参数
+            self.params = {
+                'min_trajectory_length': 18,
+                'angle_threshold': 28,
+                'curvature_threshold': 0.009,
+                'speed_threshold': 1.8,
+                'position_change_threshold': 9.0,
+                'direction_consistency_threshold': 0.65,
+                'spatial_constraint_enabled': True,
+                'left_turn_region': {
+                    'x_min': -55, 'x_max': 55,
+                    'y_min': -55, 'y_max': 55
+                }
+            }
+        elif self.intersection_id == 1:
+            # 路口1: 优化参数，基于测试结果调整
+            self.params = {
+                'min_trajectory_length': 15,      # 最小轨迹长度
+                'angle_threshold': 25,            # 角度变化阈值 (度)
+                'curvature_threshold': 0.008,     # 曲率阈值
+                'speed_threshold': 2.0,           # 最小速度阈值 (m/s)
+                'position_change_threshold': 8.0,  # 位置变化阈值 (m)
+                'direction_consistency_threshold': 0.7,  # 方向一致性阈值
+                'spatial_constraint_enabled': True,      # 启用空间约束
+                'left_turn_region': {
+                    'x_min': -50, 'x_max': 50,
+                    'y_min': -50, 'y_max': 50
+                }
+            }
+        elif self.intersection_id == 2:
+            # 路口2: 标准参数
+            self.params = {
+                'min_trajectory_length': 20,
+                'angle_threshold': 30,
+                'curvature_threshold': 0.01,
+                'speed_threshold': 1.5,
+                'position_change_threshold': 10.0,
+                'direction_consistency_threshold': 0.6,
+                'spatial_constraint_enabled': True,
+                'left_turn_region': {
+                    'x_min': -60, 'x_max': 60,
+                    'y_min': -60, 'y_max': 60
+                }
+            }
+        else:
+            # 默认参数
+            self.params = {
+                'min_trajectory_length': 18,
+                'angle_threshold': 28,
+                'curvature_threshold': 0.009,
+                'speed_threshold': 1.8,
+                'position_change_threshold': 9.0,
+                'direction_consistency_threshold': 0.65,
+                'spatial_constraint_enabled': True,
+                'left_turn_region': {
+                    'x_min': -55, 'x_max': 55,
+                    'y_min': -55, 'y_max': 55
+                }
+            }
+    
+    def print_parameters(self):
+        """打印当前使用的参数配置"""
+        print(f"\n📋 路口 {self.intersection_id} 分析参数配置:")
+        print("="*50)
+        for key, value in self.params.items():
+            if key != 'left_turn_region':
+                print(f"  {key}: {value}")
+        print(f"  left_turn_region: {self.params['left_turn_region']}")
+        print("="*50)
+    
+    def load_data(self) -> bool:
+        """加载并预处理数据"""
+        try:
+            if self.intersection_id is not None:
+                print(f"正在加载路口 {self.intersection_id} 的数据: {self.data_path}")
+            else:
+                print(f"正在加载数据: {self.data_path}")
             
-            vehicle_data = self.raw_data[self.raw_data['vehicle_id'] == vehicle_id].copy()
-            vehicle_data = vehicle_data.sort_values('frame_id')
+            # 读取数据
+            self.raw_data = pd.read_csv(self.data_path)
             
-            if len(vehicle_data) < min_trajectory_length:
-                maneuver_stats["insufficient_data"].append(vehicle_id)
-                continue
+            # 过滤指定路口的数据（如果已选择路口）
+            if self.intersection_id is not None and 'int_id' in self.raw_data.columns:
+                intersection_data = self.raw_data[self.raw_data['int_id'] == self.intersection_id]
+                if len(intersection_data) == 0:
+                    print(f"⚠️ 警告: 路口 {self.intersection_id} 没有数据")
+                    return False
+                self.raw_data = intersection_data
+                print(f"✅ 已过滤路口 {self.intersection_id} 相关车辆数据: {len(self.raw_data)}/{len(pd.read_csv(self.data_path))} 条记录")
+            else:
+                print(f"✅ 已加载完整数据: {len(self.raw_data)} 条记录")
             
-            # 精确分类机动类型
-            maneuver_type = self.classify_vehicle_maneuver(vehicle_data)
-            maneuver_stats[maneuver_type].append(vehicle_id)
+            # 进一步过滤入口方向和车道（如果指定）
+            if self.entrance_direction is not None:
+                self.raw_data = self.raw_data[self.raw_data['direction'] == self.entrance_direction]
+                print(f"✅ 已过滤入口方向 {self.entrance_direction}: {self.direction_names.get(self.entrance_direction, '未知')}")
+            
+            if self.entrance_lane is not None:
+                self.raw_data = self.raw_data[self.raw_data['lane_id'] == self.entrance_lane]
+                print(f"✅ 已过滤入口车道 {self.entrance_lane}")
+            
+            print(f"✅ 已过滤路口 {self.intersection_id} 相关车辆数据: {len(self.raw_data)}/{len(pd.read_csv(self.data_path))} 条记录")
+            print(f"包含 {self.raw_data['vehicle_id'].nunique()} 辆车辆")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ 数据加载失败: {e}")
+            return False
+    
+    def discover_intersections(self):
+        """发现数据中的所有路口"""
+        try:
+            if self.raw_data is None:
+                # 临时加载数据来发现路口
+                temp_data = pd.read_csv(self.data_path)
+            else:
+                temp_data = pd.read_csv(self.data_path)  # 重新读取完整数据
+            
+            if 'int_id' not in temp_data.columns:
+                print("⚠️ 数据中没有 'int_id' 列，无法识别路口")
+                return {}
+            
+            # 统计每个路口的基本信息
+            intersections = {}
+            for int_id in temp_data['int_id'].unique():
+                int_data = temp_data[temp_data['int_id'] == int_id]
+                intersections[int_id] = {
+                    'total_records': len(int_data),
+                    'total_vehicles': int_data['vehicle_id'].nunique(),
+                    'directions': sorted(int_data['direction'].unique()) if 'direction' in int_data.columns else [],
+                    'movements': sorted(int_data['movement'].unique()) if 'movement' in int_data.columns else []
+                }
+            
+            self.intersections = intersections
+            return intersections
+            
+        except Exception as e:
+            print(f"❌ 路口发现失败: {e}")
+            return {}
+    
+    def analyze_all_intersections(self):
+        """分析所有路口并显示统计信息"""
+        intersections = self.discover_intersections()
         
-        # 输出分类统计
-        print("=== 车辆机动分类统计 ===")
-        for maneuver_type, vehicles in maneuver_stats.items():
-            count = len(vehicles)
-            percentage = count / total_vehicles * 100
-            type_name = {
-                "left_turn": "真正左转",
-                "right_turn": "右转",
-                "u_turn_or_complex_maneuver": "掉头/复杂机动",
-                "straight_or_slight_curve": "直行/轻微弯曲",
-                "noisy_data": "数据噪声",
-                "stationary_or_minimal_movement": "静止/微小移动",
-                "complex_trajectory": "复杂轨迹",
-                "other_maneuver": "其他机动",
-                "insufficient_data": "数据不足",
-                "out_of_intersection_range": "超出路口范围",
-                "excessive_trajectory_span": "轨迹跨度过大"
-            }.get(maneuver_type, maneuver_type)
-            print(f"{type_name}: {count} 辆 ({percentage:.2f}%)")
+        if not intersections:
+            print("❌ 没有发现任何路口数据")
+            return False
         
-        # 只提取真正的左转车辆
-        left_turn_vehicles = maneuver_stats["left_turn"]
-        self.left_turn_data = self.raw_data[self.raw_data['vehicle_id'].isin(left_turn_vehicles)]
+        print(f"\n🔍 发现 {len(intersections)} 个路口:")
+        print("="*80)
+        print(f"{'路口ID':<8} {'总记录数':<12} {'车辆数':<10} {'方向':<20} {'机动类型':<15}")
+        print("-"*80)
         
-        print(f"✅ 精确识别出 {len(left_turn_vehicles)} 辆真正的左转车辆")
-        print(f"左转车辆占比: {len(left_turn_vehicles)/total_vehicles*100:.2f}%")
+        for int_id, info in sorted(intersections.items()):
+            # 转换方向为名称
+            direction_names = []
+            for direction in info['directions'][:4]:  # 最多显示4个方向
+                if direction in self.direction_names:
+                    direction_names.append(f"{direction}({self.direction_names[direction].split(' ')[0]})")
+                else:
+                    direction_names.append(str(direction))
+            directions_str = ','.join(direction_names)
+            
+            # 转换机动类型为名称
+            movement_names = []
+            for movement in info['movements'][:4]:  # 最多显示4个机动类型
+                if movement in self.movement_names:
+                    movement_names.append(f"{movement}({self.movement_names[movement].split(' ')[0]})")
+                else:
+                    movement_names.append(str(movement))
+            movements_str = ','.join(movement_names)
+            
+            print(f"{int_id:<8} {info['total_records']:<12} {info['total_vehicles']:<10} {directions_str:<20} {movements_str:<15}")
         
-        # 保存分类统计信息
-        self.maneuver_stats = maneuver_stats
-        
+        print("="*80)
         return True
     
-    def clean_trajectory_data(self, vehicle_data):
-        """清洗轨迹数据，移除异常跳跃点"""
-        if len(vehicle_data) < 3:
-            return vehicle_data
-        
-        # 计算相邻点之间的距离
-        dx = vehicle_data['local_x'].diff().fillna(0)
-        dy = vehicle_data['local_y'].diff().fillna(0)
-        distances = np.sqrt(dx**2 + dy**2)
-        
-        # 移除距离异常大的点（可能是数据错误）
-        distance_threshold = distances.quantile(0.95) * 3  # 使用95分位数的3倍作为阈值
-        valid_indices = distances <= distance_threshold
-        valid_indices.iloc[0] = True  # 保留第一个点
-        
-        return vehicle_data[valid_indices].copy()
-    
-    def ultra_clean_trajectory(self, vehicle_data):
-        """超强轨迹清洗 - 5轮迭代清洗"""
-        if len(vehicle_data) < 10:
-            return vehicle_data
-        
-        clean_data = vehicle_data.copy()
-        
-        # 5轮超强清洗
-        for iteration in range(5):
-            if len(clean_data) < 10:
-                break
-            
-            # 计算相邻点距离
-            dx = clean_data['local_x'].diff().fillna(0)
-            dy = clean_data['local_y'].diff().fillna(0)
-            distances = np.sqrt(dx**2 + dy**2)
-            
-            # 使用四分位距方法检测异常
-            q25 = distances.quantile(0.25)
-            q75 = distances.quantile(0.75)
-            iqr = q75 - q25
-            
-            # 更严格的上界
-            upper_bound = q75 + 3 * iqr
-            lower_bound = q25 - 1.5 * iqr
-            
-            # 移除异常点
-            valid_mask = (distances >= lower_bound) & (distances <= upper_bound)
-            valid_mask.iloc[0] = True  # 保留第一个点
-            
-            new_clean_data = clean_data[valid_mask].copy()
-            
-            # 如果没有移除任何点，停止清洗
-            if len(new_clean_data) == len(clean_data):
-                break
-            
-            clean_data = new_clean_data
-        
-        return clean_data
-    
-    def classify_vehicle_maneuver(self, vehicle_data):
-        """精确分类车辆机动类型"""
-        if len(vehicle_data) < 20:
-            return "insufficient_data"
-        
-        # 超强清洗
-        clean_data = self.ultra_clean_trajectory(vehicle_data)
-        
-        if len(clean_data) < 20:
-            return "insufficient_data"
-        
-        x_coords = clean_data['local_x'].values
-        y_coords = clean_data['local_y'].values
-        
-        # 基本几何特征
-        start_x, start_y = x_coords[0], y_coords[0]
-        end_x, end_y = x_coords[-1], y_coords[-1]
-        
-        straight_distance = np.sqrt((end_x - start_x)**2 + (end_y - start_y)**2)
-        
-        # 计算路径长度
-        dx = np.diff(x_coords)
-        dy = np.diff(y_coords)
-        path_length = np.sum(np.sqrt(dx**2 + dy**2))
-        
-        # 曲率比
-        curvature_ratio = path_length / straight_distance if straight_distance > 0 else float('inf')
-        
-        # 空间跨度
-        x_range = x_coords.max() - x_coords.min()
-        y_range = y_coords.max() - y_coords.min()
-        max_span = max(x_range, y_range)
-        
-        # 计算总航向角变化
-        total_heading_change = self.calculate_total_heading_change(clean_data)
-        
-        # 路口空间约束检查
-        intersection_constraint_result = self.check_intersection_spatial_constraints(clean_data)
-        if intersection_constraint_result != "valid":
-            return intersection_constraint_result
-        
-        # 分类逻辑
-        if curvature_ratio > 20:  # 路径长度是直线距离的20倍以上
-            return "noisy_data"
-        
-        if max_span < 15:  # 空间跨度小于15米
-            return "stationary_or_minimal_movement"
-        
-        if abs(total_heading_change) > 150:  # 总航向角变化超过150度
-            if straight_distance < 50:  # 净位移小于50米
-                return "u_turn_or_complex_maneuver"
-            else:
-                return "complex_trajectory"
-        
-        if 60 < abs(total_heading_change) < 120:  # 60-120度的转向
-            if straight_distance > 30 and curvature_ratio < 5:  # 有明显位移且路径相对平滑
-                if total_heading_change > 0:
-                    return "left_turn"
-                else:
-                    return "right_turn"
-        
-        if abs(total_heading_change) < 30:  # 航向角变化小于30度
-            return "straight_or_slight_curve"
-        
-        return "other_maneuver"
-    
-    def check_intersection_spatial_constraints(self, vehicle_data):
-        """检查路口空间约束"""
-        if len(vehicle_data) < 10:
-            return "insufficient_data"
-        
-        x_coords = vehicle_data['local_x'].values
-        y_coords = vehicle_data['local_y'].values
-        
-        # 计算轨迹的几何中心（转角顶点的近似位置）
-        center_x = np.mean(x_coords)
-        center_y = np.mean(y_coords)
-        
-        # 计算所有点到中心的距离
-        distances_to_center = np.sqrt((x_coords - center_x)**2 + (y_coords - center_y)**2)
-        max_distance_to_center = np.max(distances_to_center)
-        
-        # 计算起止点距离
-        start_x, start_y = x_coords[0], y_coords[0]
-        end_x, end_y = x_coords[-1], y_coords[-1]
-        start_end_distance = np.sqrt((end_x - start_x)**2 + (end_y - start_y)**2)
-        
-        # 路口空间约束条件
-        MAX_DISTANCE_TO_CENTER = 200  # 与转角顶点最大距离200米
-        MAX_START_END_DISTANCE = 300  # 起止点最大距离300米
-        
-        # 检查约束条件
-        if max_distance_to_center > MAX_DISTANCE_TO_CENTER:
-            print(f"    ❌ 轨迹超出路口范围: 最大距离中心 {max_distance_to_center:.1f}m > {MAX_DISTANCE_TO_CENTER}m")
-            return "out_of_intersection_range"
-        
-        if start_end_distance > MAX_START_END_DISTANCE:
-            print(f"    ❌ 起止点距离过大: {start_end_distance:.1f}m > {MAX_START_END_DISTANCE}m")
-            return "excessive_trajectory_span"
-        
-        # 通过空间约束检查
-        print(f"    ✅ 空间约束检查通过: 最大距离中心 {max_distance_to_center:.1f}m, 起止距离 {start_end_distance:.1f}m")
-        return "valid"
-    
-    def calculate_total_heading_change(self, vehicle_data):
-        """计算总航向角变化"""
-        if len(vehicle_data) < 3:
-            return 0
-        
-        x_coords = vehicle_data['local_x'].values
-        y_coords = vehicle_data['local_y'].values
-        
-        # 计算平滑的航向角
-        dx = np.diff(x_coords)
-        dy = np.diff(y_coords)
-        
-        # 使用较大的平滑窗口
-        window_size = min(15, len(dx) // 3)
-        if window_size >= 3:
-            dx_smooth = pd.Series(dx).rolling(window=window_size, center=True).mean().fillna(pd.Series(dx))
-            dy_smooth = pd.Series(dy).rolling(window=window_size, center=True).mean().fillna(pd.Series(dy))
-        else:
-            dx_smooth = pd.Series(dx)
-            dy_smooth = pd.Series(dy)
-        
-        headings = np.degrees(np.arctan2(dy_smooth, dx_smooth))
-        
-        # 计算累积航向角变化
-        heading_diffs = np.diff(headings)
-        
-        # 处理角度跨越
-        heading_diffs = np.where(heading_diffs > 180, heading_diffs - 360, heading_diffs)
-        heading_diffs = np.where(heading_diffs < -180, heading_diffs + 360, heading_diffs)
-        
-        # 返回累积变化
-        return np.sum(heading_diffs)
-    
-    def detect_left_turn_pattern(self, vehicle_data, heading_threshold):
-        """
-        改进的左转模式检测
-        
-        Args:
-            vehicle_data: 清洗后的车辆轨迹数据
-            heading_threshold: 航向角变化阈值
-            
-        Returns:
-            bool: 是否为左转
-        """
-        if len(vehicle_data) < 10:
-            return False
-        
-        # 进一步清洗数据 - 使用更严格的标准
-        clean_data = self.aggressive_clean_trajectory(vehicle_data)
-        
-        if len(clean_data) < 10:
-            return False
-        
-        # 计算轨迹的几何特征
-        geometry_check = self.check_trajectory_geometry(clean_data)
-        if not geometry_check:
-            return False
-        
-        # 基于分段分析的左转检测
-        segment_analysis = self.analyze_trajectory_segments(clean_data)
-        
-        # 计算累积转向
-        cumulative_turn = self.calculate_smooth_cumulative_turn(clean_data)
-        
-        # 多重验证条件
-        conditions = {
-            'max_left_turn': np.max(cumulative_turn) > heading_threshold,
-            'final_turn': cumulative_turn.iloc[-1] > heading_threshold * 0.7,
-            'consistent_turn': segment_analysis['consistent_left_turn'],
-            'geometry_valid': geometry_check,
-            'turn_smoothness': np.std(cumulative_turn) > 15
-        }
-        
-        # 至少满足4个条件才认为是左转
-        valid_conditions = sum(conditions.values())
-        is_left_turn = valid_conditions >= 4
-        
-        return is_left_turn
-    
-    def aggressive_clean_trajectory(self, vehicle_data):
-        """更激进的轨迹清洗"""
-        if len(vehicle_data) < 5:
-            return vehicle_data
-        
-        clean_data = vehicle_data.copy()
-        
-        # 多轮清洗
-        for iteration in range(3):  # 最多3轮清洗
-            if len(clean_data) < 5:
-                break
-                
-            # 计算相邻点距离
-            dx = clean_data['local_x'].diff().fillna(0)
-            dy = clean_data['local_y'].diff().fillna(0)
-            distances = np.sqrt(dx**2 + dy**2)
-            
-            # 使用更严格的阈值
-            median_distance = distances.median()
-            mad = np.median(np.abs(distances - median_distance))  # 中位数绝对偏差
-            threshold = median_distance + 5 * mad  # 更严格的阈值
-            
-            # 移除异常点
-            valid_indices = distances <= threshold
-            valid_indices.iloc[0] = True  # 保留第一个点
-            
-            new_clean_data = clean_data[valid_indices].copy()
-            
-            # 如果没有移除任何点，停止清洗
-            if len(new_clean_data) == len(clean_data):
-                break
-                
-            clean_data = new_clean_data
-        
-        return clean_data
-    
-    def check_trajectory_geometry(self, vehicle_data):
-        """检查轨迹几何特征的合理性"""
-        if len(vehicle_data) < 5:
-            return False
-        
-        x_coords = vehicle_data['local_x'].values
-        y_coords = vehicle_data['local_y'].values
-        
-        # 计算直线距离和路径长度
-        straight_distance = np.sqrt((x_coords[-1] - x_coords[0])**2 + (y_coords[-1] - y_coords[0])**2)
-        
-        dx = np.diff(x_coords)
-        dy = np.diff(y_coords)
-        path_length = np.sum(np.sqrt(dx**2 + dy**2))
-        
-        # 曲率比检查
-        if straight_distance > 0:
-            curvature_ratio = path_length / straight_distance
-            # 对于真实的左转，曲率比应该在合理范围内
-            if curvature_ratio > 50:  # 如果路径长度是直线距离的50倍以上，可能是噪声
+    def select_intersection_interactive(self):
+        """交互式选择路口"""
+        if not self.intersections:
+            if not self.analyze_all_intersections():
                 return False
         
-        # 检查轨迹是否有明显的空间变化
-        x_range = x_coords.max() - x_coords.min()
-        y_range = y_coords.max() - y_coords.min()
+        print(f"\n🎯 请选择要分析的路口:")
+        print("="*40)
         
-        # 轨迹应该有一定的空间跨度
-        if max(x_range, y_range) < 10:  # 小于10米的变化可能不是真正的转向
+        for int_id, info in sorted(self.intersections.items()):
+            print(f"{int_id}. 路口{int_id} - 车辆: {info['total_vehicles']} 辆")
+        
+        try:
+            selected_id = int(input(f"请输入路口ID (默认: {self.intersection_id}): ").strip() or str(self.intersection_id))
+            
+            if selected_id not in self.intersections:
+                print(f"⚠️ 路口 {selected_id} 不存在，使用默认路口 {self.intersection_id}")
+                selected_id = self.intersection_id
+            
+            self.intersection_id = selected_id
+            self.selected_intersection = self.intersections[selected_id]
+            
+            # 重新设置参数
+            self.setup_intersection_parameters()
+            
+            print(f"✅ 选择路口: {selected_id}")
+            return True
+            
+        except ValueError:
+            print(f"⚠️ 输入无效，使用默认路口 {self.intersection_id}")
+            self.selected_intersection = self.intersections.get(self.intersection_id, {})
+            return True
+    
+    def analyze_intersection_entrances(self):
+        """分析路口的入口方向统计"""
+        if self.raw_data is None:
+            print("❌ 请先加载数据")
+            return None
+        
+        print(f"\n🔍 分析路口 {self.intersection_id} 的入口情况...")
+        
+        # 按方向分组统计
+        entrance_stats = {}
+        
+        if 'direction' not in self.raw_data.columns:
+            print("⚠️ 数据中没有 'direction' 列，无法分析入口")
+            return None
+        
+        direction_groups = self.raw_data.groupby('direction')
+        
+        for direction, group_data in direction_groups:
+            # 统计该方向的车辆
+            total_vehicles = group_data['vehicle_id'].nunique()
+            
+            # 统计左转车辆 (movement = 2)
+            left_turn_vehicles = 0
+            if 'movement' in group_data.columns:
+                left_turn_data = group_data[group_data['movement'] == 2]
+                left_turn_vehicles = left_turn_data['vehicle_id'].nunique()
+            
+            # 计算左转比例
+            left_turn_ratio = (left_turn_vehicles / total_vehicles * 100) if total_vehicles > 0 else 0
+            
+            entrance_key = f"方向{direction}"
+            entrance_stats[entrance_key] = {
+                'direction': direction,
+                'direction_name': self.direction_names.get(direction, f"方向{direction}"),
+                'total_vehicles': total_vehicles,
+                'left_turn_vehicles': left_turn_vehicles,
+                'left_turn_ratio': left_turn_ratio,
+                'total_records': len(group_data)
+            }
+        
+        # 显示统计结果
+        print("="*70)
+        print(f"路口 {self.intersection_id} 入口分析结果（按方向分组）")
+        print("="*70)
+        print(f"{'入口编号':<10} {'入口方向':<25} {'总车辆':<10} {'左转车辆':<10} {'左转比例':<10}")
+        print("-"*70)
+        
+        for i, (key, stats) in enumerate(sorted(entrance_stats.items()), 1):
+            print(f"{i:<10} {stats['direction_name']:<25} {stats['total_vehicles']:<10} {stats['left_turn_vehicles']:<10} {stats['left_turn_ratio']:.1f}%")
+        
+        print("="*70)
+        print(f"总计: {len(entrance_stats)} 个入口方向")
+        
+        self.entrance_analysis = entrance_stats
+        return entrance_stats
+    
+    def select_entrance_for_analysis(self):
+        """用户选择特定入口进行分析"""
+        if not self.entrance_analysis:
+            print("❌ 请先进行入口分析")
             return False
+        
+        print(f"\n🎯 请选择要详细分析的入口方向:")
+        print("="*50)
+        
+        entrance_list = list(self.entrance_analysis.items())
+        
+        for i, (key, stats) in enumerate(entrance_list, 1):
+            print(f"{i}. {stats['direction_name']} - 左转车辆: {stats['left_turn_vehicles']} 辆 ({stats['left_turn_ratio']:.1f}%)")
+        
+        print("0. 分析所有入口方向的左转车辆")
+        
+        try:
+            choice = int(input(f"请输入入口编号 (0-{len(entrance_list)}): ").strip())
+            
+            if choice == 0:
+                print("✅ 选择分析所有入口方向")
+                self.selected_entrance = None
+                self.selected_entrance_key = None
+                return True
+            elif 1 <= choice <= len(entrance_list):
+                selected_key, selected_stats = entrance_list[choice - 1]
+                self.selected_entrance = selected_stats
+                self.selected_entrance_key = selected_key
+                print(f"✅ 选择入口方向: {selected_stats['direction_name']}")
+                print(f"   该入口方向有 {selected_stats['left_turn_vehicles']} 辆左转车辆")
+                return True
+            else:
+                print("⚠️ 选择无效，将分析所有入口方向")
+                self.selected_entrance = None
+                self.selected_entrance_key = None
+                return True
+                
+        except ValueError:
+            print("⚠️ 输入无效，将分析所有入口方向")
+            self.selected_entrance = None
+            self.selected_entrance_key = None
+            return True
+    
+    def filter_entrance_data(self):
+        """根据路口和方向筛选数据"""
+        if self.raw_data is None:
+            print("❌ 请先加载数据")
+            return False
+        
+        original_count = len(self.raw_data)
+        original_vehicles = self.raw_data['vehicle_id'].nunique()
+        
+        if self.selected_entrance is not None:
+            # 筛选特定入口方向的数据
+            direction = self.selected_entrance['direction']
+            print(f"\n🔍 筛选入口数据: {self.selected_entrance['direction_name']}")
+            
+            # 按方向筛选
+            self.raw_data = self.raw_data[self.raw_data['direction'] == direction]
+            
+            # 进一步筛选左转车辆 (movement = 2)
+            if 'movement' in self.raw_data.columns:
+                left_turn_data = self.raw_data[self.raw_data['movement'] == 2]
+                if len(left_turn_data) > 0:
+                    self.raw_data = left_turn_data
+                    print(f"✅ 已筛选入口左转数据:")
+                    print(f"   左转车辆数: {self.raw_data['vehicle_id'].nunique()}")
+                    print(f"   轨迹记录数: {len(self.raw_data):,}/{original_count:,}")
+                else:
+                    print(f"⚠️ 该入口方向没有左转车辆数据")
+                    return False
+            else:
+                print(f"⚠️ 数据中没有 'movement' 列，无法筛选左转车辆")
+        else:
+            # 分析所有入口方向的左转车辆
+            print(f"\n🔍 筛选所有入口方向的左转车辆")
+            if 'movement' in self.raw_data.columns:
+                left_turn_data = self.raw_data[self.raw_data['movement'] == 2]
+                if len(left_turn_data) > 0:
+                    self.raw_data = left_turn_data
+                    print(f"✅ 已筛选所有入口左转数据:")
+                    print(f"   左转车辆数: {self.raw_data['vehicle_id'].nunique()}")
+                    print(f"   轨迹记录数: {len(self.raw_data):,}/{original_count:,}")
+                else:
+                    print(f"⚠️ 没有找到左转车辆数据")
+                    return False
+            else:
+                print(f"⚠️ 数据中没有 'movement' 列，无法筛选左转车辆")
         
         return True
     
-    def analyze_trajectory_segments(self, vehicle_data):
-        """分段分析轨迹"""
-        if len(vehicle_data) < 20:
-            return {'consistent_left_turn': False}
+    def calculate_trajectory_angle_change(self, trajectory_data: pd.DataFrame) -> float:
+        """计算轨迹的角度变化"""
+        if len(trajectory_data) < 3:
+            return 0.0
         
-        x_coords = vehicle_data['local_x'].values
-        y_coords = vehicle_data['local_y'].values
+        # 按时间排序
+        traj = trajectory_data.sort_values('frame_id')
         
-        # 将轨迹分成5段
-        n_segments = 5
-        segment_size = len(x_coords) // n_segments
-        
-        segment_directions = []
-        for i in range(n_segments):
-            start_idx = i * segment_size
-            end_idx = min((i + 1) * segment_size, len(x_coords))
+        angles = []
+        for i in range(1, len(traj) - 1):
+            # 计算前后两段的方向向量
+            x1, y1 = traj.iloc[i-1][['local_x', 'local_y']]
+            x2, y2 = traj.iloc[i][['local_x', 'local_y']]
+            x3, y3 = traj.iloc[i+1][['local_x', 'local_y']]
             
-            if end_idx - start_idx < 3:
-                continue
+            # 向量1: (x1,y1) -> (x2,y2)
+            v1 = np.array([x2-x1, y2-y1])
+            # 向量2: (x2,y2) -> (x3,y3)
+            v2 = np.array([x3-x2, y3-y2])
             
-            # 计算段的主方向
-            dx_seg = x_coords[end_idx-1] - x_coords[start_idx]
-            dy_seg = y_coords[end_idx-1] - y_coords[start_idx]
+            # 计算角度
+            if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
+                cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+                cos_angle = np.clip(cos_angle, -1, 1)  # 防止数值误差
+                angle = np.arccos(cos_angle) * 180 / np.pi
+                angles.append(angle)
+        
+        return np.sum(angles) if angles else 0.0
+    
+    def calculate_trajectory_curvature(self, trajectory_data: pd.DataFrame) -> float:
+        """计算轨迹的平均曲率"""
+        if len(trajectory_data) < 3:
+            return 0.0
+        
+        # 按时间排序
+        traj = trajectory_data.sort_values('frame_id')
+        
+        curvatures = []
+        for i in range(1, len(traj) - 1):
+            # 获取三个连续点
+            x1, y1 = traj.iloc[i-1][['local_x', 'local_y']]
+            x2, y2 = traj.iloc[i][['local_x', 'local_y']]
+            x3, y3 = traj.iloc[i+1][['local_x', 'local_y']]
             
-            if dx_seg == 0 and dy_seg == 0:
-                continue
+            # 计算曲率 k = |det(v1, v2)| / |v1|^3
+            # 其中 v1 = (x2-x1, y2-y1), v2 = (x3-x2, y3-y2)
+            v1_x, v1_y = x2-x1, y2-y1
+            v2_x, v2_y = x3-x2, y3-y2
             
-            direction = np.degrees(np.arctan2(dy_seg, dx_seg))
-            segment_directions.append(direction)
+            # 行列式
+            det = v1_x * v2_y - v1_y * v2_x
+            
+            # v1的模长
+            v1_norm = np.sqrt(v1_x**2 + v1_y**2)
+            
+            if v1_norm > 0:
+                curvature = abs(det) / (v1_norm**3)
+                curvatures.append(curvature)
         
-        if len(segment_directions) < 3:
-            return {'consistent_left_turn': False}
-        
-        # 计算方向变化
-        direction_changes = []
-        for i in range(1, len(segment_directions)):
-            change = segment_directions[i] - segment_directions[i-1]
-            # 标准化角度
-            while change > 180:
-                change -= 360
-            while change < -180:
-                change += 360
-            direction_changes.append(change)
-        
-        # 检查是否有一致的左转趋势
-        left_turns = [change for change in direction_changes if change > 10]  # 大于10度的左转
-        total_left_turn = sum(left_turns)
-        
-        consistent_left_turn = (len(left_turns) >= len(direction_changes) * 0.6 and 
-                               total_left_turn > 30)
-        
-        return {'consistent_left_turn': consistent_left_turn}
+        return np.mean(curvatures) if curvatures else 0.0
     
-    def calculate_smooth_cumulative_turn(self, vehicle_data):
-        """计算平滑的累积转向"""
-        if len(vehicle_data) < 3:
-            return pd.Series([0])
-        
-        x_coords = vehicle_data['local_x'].values
-        y_coords = vehicle_data['local_y'].values
-        
-        # 计算移动方向
-        dx = np.diff(x_coords)
-        dy = np.diff(y_coords)
-        
-        # 使用更大的平滑窗口
-        window_size = min(10, len(dx) // 3)
-        if window_size >= 3:
-            dx_smooth = pd.Series(dx).rolling(window=window_size, center=True).mean().fillna(pd.Series(dx))
-            dy_smooth = pd.Series(dy).rolling(window=window_size, center=True).mean().fillna(pd.Series(dy))
-        else:
-            dx_smooth = pd.Series(dx)
-            dy_smooth = pd.Series(dy)
-        
-        # 计算航向角
-        headings = np.degrees(np.arctan2(dy_smooth, dx_smooth))
-        
-        # 计算累积转向
-        return self.calculate_cumulative_turn(headings)
-    
-    def calculate_cumulative_turn(self, headings):
-        """计算累积转向角度"""
-        if len(headings) < 2:
-            return pd.Series([0])
-        
-        # 计算相邻航向角的差异
-        heading_diffs = headings.diff().fillna(0)
-        
-        # 处理角度跨越问题
-        heading_diffs = heading_diffs.apply(lambda x: self.normalize_angle(x))
-        
-        # 计算累积转向（正值表示左转，负值表示右转）
-        cumulative_turn = heading_diffs.cumsum()
-        
-        return cumulative_turn
-    
-    def normalize_angle(self, angle):
-        """标准化角度到[-180, 180]范围"""
-        while angle > 180:
-            angle -= 360
-        while angle < -180:
-            angle += 360
-        return angle
-    
-    def calculate_heading_change(self, vehicle_data):
+    def classify_vehicle_maneuver(self, vehicle_data: pd.DataFrame) -> str:
         """
-        计算车辆的航向角变化
+        精确分类车辆机动类型
         
         Args:
             vehicle_data: 单个车辆的轨迹数据
             
         Returns:
-            float: 航向角变化（度）
+            机动类型: 'left_turn', 'right_turn', 'through', 'u_turn', 'insufficient_data'
         """
-        if len(vehicle_data) < 2:
-            return 0
+        if len(vehicle_data) < self.params['min_trajectory_length']:
+            return 'insufficient_data'
         
-        # 基于位置变化计算航向角
-        dx = vehicle_data['local_x'].diff().fillna(0)
-        dy = vehicle_data['local_y'].diff().fillna(0)
-        headings = np.degrees(np.arctan2(dy, dx))
+        # 按时间排序
+        traj = vehicle_data.sort_values('frame_id').reset_index(drop=True)
         
-        if len(headings) > 1:
-            heading_start = headings.iloc[1]  # 跳过第一个NaN值
-            heading_end = headings.iloc[-1]
-            heading_change = heading_end - heading_start
+        # 1. 基于movement字段的直接判断（如果可用且可靠）
+        if 'movement' in traj.columns:
+            movements = traj['movement'].unique()
+            if len(movements) == 1:
+                movement = movements[0]
+                if movement == 2:
+                    return 'left_turn'
+                elif movement == 3:
+                    return 'right_turn'
+                elif movement == 1:
+                    return 'through'
+                elif movement == 4:
+                    return 'u_turn'
+        
+        # 2. 基于轨迹几何特征的分析
+        
+        # 计算总角度变化
+        total_angle_change = self.calculate_trajectory_angle_change(traj)
+        
+        # 计算平均曲率
+        avg_curvature = self.calculate_trajectory_curvature(traj)
+        
+        # 计算位置变化
+        start_pos = np.array([traj.iloc[0]['local_x'], traj.iloc[0]['local_y']])
+        end_pos = np.array([traj.iloc[-1]['local_x'], traj.iloc[-1]['local_y']])
+        position_change = np.linalg.norm(end_pos - start_pos)
+        
+        # 计算方向变化
+        if len(traj) >= 2:
+            initial_direction = np.arctan2(
+                traj.iloc[1]['local_y'] - traj.iloc[0]['local_y'],
+                traj.iloc[1]['local_x'] - traj.iloc[0]['local_x']
+            )
+            final_direction = np.arctan2(
+                traj.iloc[-1]['local_y'] - traj.iloc[-2]['local_y'],
+                traj.iloc[-1]['local_x'] - traj.iloc[-2]['local_x']
+            )
+            direction_change = abs(final_direction - initial_direction) * 180 / np.pi
+            if direction_change > 180:
+                direction_change = 360 - direction_change
         else:
-            heading_change = 0
+            direction_change = 0
         
-        # 处理角度跨越问题
-        if heading_change > 180:
-            heading_change -= 360
-        elif heading_change < -180:
-            heading_change += 360
+        # 3. 分类逻辑
+        
+        # 左转判断
+        if (total_angle_change > self.params['angle_threshold'] and 
+            avg_curvature > self.params['curvature_threshold'] and
+            position_change > self.params['position_change_threshold'] and
+            direction_change > 45):
             
-        return abs(heading_change)
+            # 进一步判断是左转还是右转
+            # 通过轨迹的弯曲方向判断
+            mid_point = len(traj) // 2
+            if mid_point > 0 and mid_point < len(traj) - 1:
+                # 计算轨迹中点的弯曲方向
+                x1, y1 = traj.iloc[0][['local_x', 'local_y']]
+                x2, y2 = traj.iloc[mid_point][['local_x', 'local_y']]
+                x3, y3 = traj.iloc[-1][['local_x', 'local_y']]
+                
+                # 使用叉积判断弯曲方向
+                cross_product = (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)
+                
+                if cross_product > 0:
+                    return 'left_turn'
+                else:
+                    return 'right_turn'
+            
+            return 'left_turn'  # 默认左转
+        
+        # 掉头判断
+        elif direction_change > 135 and avg_curvature > self.params['curvature_threshold'] * 2:
+            return 'u_turn'
+        
+        # 右转判断
+        elif (total_angle_change > self.params['angle_threshold'] * 0.6 and
+              avg_curvature > self.params['curvature_threshold'] * 0.5 and
+              30 < direction_change < 120):
+            return 'right_turn'
+        
+        # 直行判断
+        elif (total_angle_change < self.params['angle_threshold'] * 0.5 and
+              avg_curvature < self.params['curvature_threshold'] * 0.5 and
+              direction_change < 30):
+            return 'through'
+        
+        # 默认情况
+        else:
+            return 'insufficient_data'
     
-    def select_sample_vehicles(self, num_samples=5):
-        """选择代表性的左转车辆样例"""
-        if self.left_turn_data is None:
-            print("请先识别左转车辆")
+    def identify_left_turn_vehicles(self) -> bool:
+        """识别左转车辆"""
+        if self.raw_data is None:
+            print("❌ 请先加载数据")
             return False
         
-        left_turn_vehicles = self.left_turn_data['vehicle_id'].unique()
+        print(f"\n🔍 开始识别左转车辆...")
         
-        # 计算每辆车的轨迹长度和特征
-        vehicle_stats = []
-        for vehicle_id in left_turn_vehicles:
+        left_turn_vehicles = []
+        vehicle_classifications = {}
+        
+        # 获取所有车辆ID
+        vehicle_ids = self.raw_data['vehicle_id'].unique()
+        
+        print(f"正在分析 {len(vehicle_ids)} 辆车辆的机动类型...")
+        
+        for i, vehicle_id in enumerate(vehicle_ids):
+            if i % 50 == 0:  # 每50辆车显示一次进度
+                print(f"  进度: {i+1}/{len(vehicle_ids)} ({(i+1)/len(vehicle_ids)*100:.1f}%)")
+            
+            # 获取车辆轨迹数据
+            vehicle_data = self.raw_data[self.raw_data['vehicle_id'] == vehicle_id]
+            
+            # 分类机动类型
+            maneuver_type = self.classify_vehicle_maneuver(vehicle_data)
+            vehicle_classifications[vehicle_id] = maneuver_type
+            
+            # 如果是左转车辆，添加到列表
+            if maneuver_type == 'left_turn':
+                left_turn_vehicles.append(vehicle_id)
+        
+        # 保存结果
+        self.maneuver_classification = vehicle_classifications
+        
+        # 筛选左转车辆数据
+        if left_turn_vehicles:
+            self.left_turn_data = self.raw_data[self.raw_data['vehicle_id'].isin(left_turn_vehicles)]
+            
+            print(f"\n✅ 左转车辆识别完成!")
+            print(f"   总车辆数: {len(vehicle_ids)}")
+            print(f"   左转车辆数: {len(left_turn_vehicles)}")
+            print(f"   左转比例: {len(left_turn_vehicles)/len(vehicle_ids)*100:.1f}%")
+            
+            # 显示各类机动的统计
+            maneuver_counts = {}
+            for maneuver in vehicle_classifications.values():
+                maneuver_counts[maneuver] = maneuver_counts.get(maneuver, 0) + 1
+            
+            print(f"\n📊 机动类型统计:")
+            for maneuver, count in sorted(maneuver_counts.items()):
+                percentage = count / len(vehicle_ids) * 100
+                print(f"   {maneuver}: {count} 辆 ({percentage:.1f}%)")
+            
+            return True
+        else:
+            print(f"\n⚠️ 未识别到左转车辆")
+            print("可能原因:")
+            print("1. 数据中确实没有左转车辆")
+            print("2. 轨迹长度不足或质量较差")
+            print("3. 参数设置需要调整")
+            
+            # 显示参数建议
+            print(f"\n当前参数设置:")
+            print(f"  最小轨迹长度: {self.params['min_trajectory_length']}")
+            print(f"  角度阈值: {self.params['angle_threshold']}°")
+            print(f"  曲率阈值: {self.params['curvature_threshold']}")
+            
+            return False
+    
+    def select_sample_vehicles(self, num_samples: int = 5) -> bool:
+        """选择样例车辆进行详细分析"""
+        if self.left_turn_data is None or len(self.left_turn_data) == 0:
+            print("❌ 没有左转车辆数据可供分析")
+            return False
+        
+        # 获取所有左转车辆ID
+        left_turn_vehicle_ids = self.left_turn_data['vehicle_id'].unique()
+        
+        if len(left_turn_vehicle_ids) == 0:
+            print("❌ 没有找到左转车辆")
+            return False
+        
+        # 选择样例车辆
+        num_samples = min(num_samples, len(left_turn_vehicle_ids))
+        
+        # 优先选择轨迹较长的车辆
+        vehicle_trajectory_lengths = {}
+        for vehicle_id in left_turn_vehicle_ids:
             vehicle_data = self.left_turn_data[self.left_turn_data['vehicle_id'] == vehicle_id]
-            
-            # 计算航向角变化
-            if 'local_x' in vehicle_data.columns and 'local_y' in vehicle_data.columns:
-                dx = vehicle_data['local_x'].diff().fillna(0)
-                dy = vehicle_data['local_y'].diff().fillna(0)
-                headings = np.degrees(np.arctan2(dy, dx))
-                heading_change = abs(headings.iloc[-1] - headings.iloc[1]) if len(headings) > 1 else 0
-            else:
-                heading_change = 0
-            
-            stats = {
-                'vehicle_id': vehicle_id,
-                'trajectory_length': len(vehicle_data),
-                'speed_variance': vehicle_data['v_vel'].var() if 'v_vel' in vehicle_data.columns else 0,
-                'heading_change': heading_change
-            }
-            vehicle_stats.append(stats)
+            vehicle_trajectory_lengths[vehicle_id] = len(vehicle_data)
         
-        # 按轨迹长度和特征多样性选择样例
-        vehicle_stats_df = pd.DataFrame(vehicle_stats)
-        vehicle_stats_df = vehicle_stats_df.sort_values(['trajectory_length', 'speed_variance'], ascending=[False, False])
+        # 按轨迹长度排序，选择前num_samples个
+        sorted_vehicles = sorted(vehicle_trajectory_lengths.items(), key=lambda x: x[1], reverse=True)
+        self.sample_vehicles = [vehicle_id for vehicle_id, _ in sorted_vehicles[:num_samples]]
         
-        # 选择前num_samples个车辆
-        selected_vehicles = vehicle_stats_df.head(num_samples)['vehicle_id'].tolist()
-        self.sample_vehicles = selected_vehicles
+        print(f"\n✅ 已选择 {len(self.sample_vehicles)} 个样例车辆进行详细分析:")
+        for i, vehicle_id in enumerate(self.sample_vehicles, 1):
+            trajectory_length = vehicle_trajectory_lengths[vehicle_id]
+            print(f"   {i}. 车辆 {vehicle_id}: {trajectory_length} 个轨迹点")
         
-        print(f"选择了 {len(selected_vehicles)} 辆代表性左转车辆进行详细分析")
         return True
     
-    def extract_features(self, vehicle_ids):
-        """提取车辆特征"""
-        if not vehicle_ids:
-            return {}
-        
-        features = {}
-        for vehicle_id in vehicle_ids:
-            vehicle_data = self.left_turn_data[self.left_turn_data['vehicle_id'] == vehicle_id]
-            if len(vehicle_data) == 0:
-                continue
-                
-            # 提取基本特征
-            features[vehicle_id] = {
-                'trajectory_length': len(vehicle_data),
-                'avg_speed': vehicle_data['v_Vel'].mean(),
-                'max_speed': vehicle_data['v_Vel'].max(),
-                'start_position': (vehicle_data.iloc[0]['local_x'], vehicle_data.iloc[0]['local_y']),
-                'end_position': (vehicle_data.iloc[-1]['local_x'], vehicle_data.iloc[-1]['local_y']),
-                'heading_change': self.calculate_heading_change(vehicle_data)
-            }
-        
-        return features
-    
-    def analyze_sample_features(self, output_dir='left_turn_analysis'):
-        """分析样例车辆特征"""
+    def analyze_sample_features(self, output_dir: str) -> Optional[pd.DataFrame]:
+        """分析样例车辆的详细特征"""
         if not self.sample_vehicles:
-            print("请先选择样例车辆")
+            print("❌ 没有样例车辆可供分析")
             return None
         
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        print(f"\n🔍 分析 {len(self.sample_vehicles)} 个样例车辆的特征...")
         
-        print(f"\n=== 左转车辆样例特征分析 ===")
+        features_list = []
         
-        sample_features = []
-        
-        for i, vehicle_id in enumerate(self.sample_vehicles):
-            vehicle_data = self.left_turn_data[self.left_turn_data['vehicle_id'] == vehicle_id].copy()
-            vehicle_data = vehicle_data.sort_values('frame_id')
+        for vehicle_id in self.sample_vehicles:
+            # 获取车辆轨迹数据
+            vehicle_data = self.left_turn_data[self.left_turn_data['vehicle_id'] == vehicle_id].sort_values('frame_id')
             
-            # 计算航向角
-            if 'local_x' in vehicle_data.columns and 'local_y' in vehicle_data.columns:
-                dx = vehicle_data['local_x'].diff().fillna(0)
-                dy = vehicle_data['local_y'].diff().fillna(0)
-                headings = np.degrees(np.arctan2(dy, dx))
-                heading_start = headings.iloc[1] if len(headings) > 1 else 0
-                heading_end = headings.iloc[-1] if len(headings) > 1 else 0
-                heading_change = heading_end - heading_start
+            if len(vehicle_data) < 2:
+                continue
+            
+            # 基本特征
+            trajectory_length = len(vehicle_data)
+            duration = vehicle_data['frame_id'].max() - vehicle_data['frame_id'].min()
+            
+            # 位置特征
+            start_x, start_y = vehicle_data.iloc[0][['local_x', 'local_y']]
+            end_x, end_y = vehicle_data.iloc[-1][['local_x', 'local_y']]
+            total_distance = np.sqrt((end_x - start_x)**2 + (end_y - start_y)**2)
+            
+            # 速度特征
+            if 'v_vel' in vehicle_data.columns:
+                avg_speed = vehicle_data['v_vel'].mean()
+                max_speed = vehicle_data['v_vel'].max()
+                min_speed = vehicle_data['v_vel'].min()
+                speed_std = vehicle_data['v_vel'].std()
             else:
-                heading_start = heading_end = heading_change = 0
+                avg_speed = max_speed = min_speed = speed_std = 0
             
-            # 计算特征
+            # 加速度特征
+            if 'v_acc' in vehicle_data.columns:
+                avg_acceleration = vehicle_data['v_acc'].mean()
+                max_acceleration = vehicle_data['v_acc'].max()
+                min_acceleration = vehicle_data['v_acc'].min()
+                acc_std = vehicle_data['v_acc'].std()
+            else:
+                avg_acceleration = max_acceleration = min_acceleration = acc_std = 0
+            
+            # 几何特征
+            total_angle_change = self.calculate_trajectory_angle_change(vehicle_data)
+            avg_curvature = self.calculate_trajectory_curvature(vehicle_data)
+            
+            # 机动分类
+            maneuver_type = self.maneuver_classification.get(vehicle_id, 'unknown')
+            
+            # 入口信息
+            if 'direction' in vehicle_data.columns:
+                entrance_direction = vehicle_data['direction'].iloc[0]
+                entrance_name = self.direction_names.get(entrance_direction, f"方向{entrance_direction}")
+            else:
+                entrance_direction = 0
+                entrance_name = "未知"
+            
             features = {
                 'vehicle_id': vehicle_id,
-                'trajectory_length': len(vehicle_data),
-                'duration': (vehicle_data['frame_id'].max() - vehicle_data['frame_id'].min()) * 0.1,  # 假设0.1s/frame
-                'avg_speed': vehicle_data['v_vel'].mean() if 'v_vel' in vehicle_data.columns else 0,
-                'max_speed': vehicle_data['v_vel'].max() if 'v_vel' in vehicle_data.columns else 0,
-                'min_speed': vehicle_data['v_vel'].min() if 'v_vel' in vehicle_data.columns else 0,
-                'speed_std': vehicle_data['v_vel'].std() if 'v_vel' in vehicle_data.columns else 0,
-                'avg_acceleration': vehicle_data['v_acc'].mean() if 'v_acc' in vehicle_data.columns else 0,
-                'max_acceleration': vehicle_data['v_acc'].max() if 'v_acc' in vehicle_data.columns else 0,
-                'min_acceleration': vehicle_data['v_acc'].min() if 'v_acc' in vehicle_data.columns else 0,
-                'acc_std': vehicle_data['v_acc'].std() if 'v_acc' in vehicle_data.columns else 0,
-                'heading_start': heading_start,
-                'heading_end': heading_end,
-                'heading_change': heading_change,
-                'start_x': vehicle_data['local_x'].iloc[0] if 'local_x' in vehicle_data.columns else 0,
-                'start_y': vehicle_data['local_y'].iloc[0] if 'local_y' in vehicle_data.columns else 0,
-                'end_x': vehicle_data['local_x'].iloc[-1] if 'local_x' in vehicle_data.columns else 0,
-                'end_y': vehicle_data['local_y'].iloc[-1] if 'local_y' in vehicle_data.columns else 0,
-                'total_distance': np.sqrt((vehicle_data['local_x'].iloc[-1] - vehicle_data['local_x'].iloc[0])**2 + 
-                                        (vehicle_data['local_y'].iloc[-1] - vehicle_data['local_y'].iloc[0])**2) if 'local_x' in vehicle_data.columns and 'local_y' in vehicle_data.columns else 0,
-                'path_length': np.sum(np.sqrt(np.diff(vehicle_data['local_x'])**2 + np.diff(vehicle_data['local_y'])**2)) if 'local_x' in vehicle_data.columns and 'local_y' in vehicle_data.columns else 0
+                'trajectory_length': trajectory_length,
+                'duration_frames': duration,
+                'start_x': start_x,
+                'start_y': start_y,
+                'end_x': end_x,
+                'end_y': end_y,
+                'total_distance': total_distance,
+                'avg_speed': avg_speed,
+                'max_speed': max_speed,
+                'min_speed': min_speed,
+                'speed_std': speed_std,
+                'avg_acceleration': avg_acceleration,
+                'max_acceleration': max_acceleration,
+                'min_acceleration': min_acceleration,
+                'acceleration_std': acc_std,
+                'total_angle_change': total_angle_change,
+                'avg_curvature': avg_curvature,
+                'maneuver_type': maneuver_type,
+                'entrance_direction': entrance_direction,
+                'entrance_name': entrance_name
             }
             
-            # 处理航向角跨越问题
-            if features['heading_change'] > 180:
-                features['heading_change'] -= 360
-            elif features['heading_change'] < -180:
-                features['heading_change'] += 360
-            
-            sample_features.append(features)
-            
-            # 输出详细特征信息
-            print(f"\n--- 车辆 {vehicle_id} 特征分析 ---")
-            print(f"轨迹长度: {features['trajectory_length']} 个时间步")
-            print(f"持续时间: {features['duration']:.1f} 秒")
-            print(f"速度统计: 平均 {features['avg_speed']:.2f} m/s, 范围 [{features['min_speed']:.2f}, {features['max_speed']:.2f}] m/s")
-            print(f"速度标准差: {features['speed_std']:.2f} m/s")
-            print(f"加速度统计: 平均 {features['avg_acceleration']:.2f} m/s², 范围 [{features['min_acceleration']:.2f}, {features['max_acceleration']:.2f}] m/s²")
-            print(f"加速度标准差: {features['acc_std']:.2f} m/s²")
-            print(f"航向角变化: {features['heading_start']:.1f}° → {features['heading_end']:.1f}° (变化 {features['heading_change']:.1f}°)")
-            print(f"起点坐标: ({features['start_x']:.1f}, {features['start_y']:.1f}) m")
-            print(f"终点坐标: ({features['end_x']:.1f}, {features['end_y']:.1f}) m")
-            print(f"直线距离: {features['total_distance']:.2f} m")
-            print(f"路径长度: {features['path_length']:.2f} m")
-            print(f"路径曲率: {features['path_length']/features['total_distance']:.2f}")
+            features_list.append(features)
+        
+        # 创建DataFrame
+        features_df = pd.DataFrame(features_list)
         
         # 保存特征数据
-        features_df = pd.DataFrame(sample_features)
-        features_df.to_csv(os.path.join(output_dir, 'left_turn_sample_features.csv'), index=False)
-        print(f"\n特征数据已保存到: {output_dir}/left_turn_sample_features.csv")
+        os.makedirs(output_dir, exist_ok=True)
+        features_file = os.path.join(output_dir, f'intersection_{self.intersection_id}_left_turn_sample_features.csv')
+        features_df.to_csv(features_file, index=False, encoding='utf-8-sig')
         
-        return sample_features
+        print(f"✅ 样例车辆特征分析完成，已保存到: {features_file}")
+        
+        # 显示统计摘要
+        print(f"\n📊 样例车辆特征摘要:")
+        print(f"   平均轨迹长度: {features_df['trajectory_length'].mean():.1f} 点")
+        print(f"   平均持续时间: {features_df['duration_frames'].mean():.1f} 帧")
+        print(f"   平均速度: {features_df['avg_speed'].mean():.2f} m/s")
+        print(f"   平均角度变化: {features_df['total_angle_change'].mean():.1f}°")
+        print(f"   平均曲率: {features_df['avg_curvature'].mean():.6f}")
+        
+        return features_df
     
-    def visualize_trajectories(self, output_dir='left_turn_analysis'):
-        """可视化左转车辆轨迹"""
+    def visualize_trajectories(self, output_dir: str):
+        """可视化样例车辆轨迹"""
         if not self.sample_vehicles:
-            print("请先选择样例车辆")
+            print("❌ 没有样例车辆可供可视化")
             return
         
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        print(f"\n🎨 生成 {len(self.sample_vehicles)} 个样例车辆的轨迹可视化...")
         
-        # 创建综合分析图
-        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+        # 创建图形
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        axes = axes.flatten()
         
-        colors = ['red', 'blue', 'green', 'orange', 'purple']
-        
+        # 为每个样例车辆绘制轨迹
         for i, vehicle_id in enumerate(self.sample_vehicles):
-            vehicle_data = self.left_turn_data[self.left_turn_data['vehicle_id'] == vehicle_id].copy()
-            vehicle_data = vehicle_data.sort_values('frame_id')
+            if i >= 6:  # 最多显示6个
+                break
+                
+            ax = axes[i]
             
-            color = colors[i % len(colors)]
-            time_steps = range(len(vehicle_data))
+            # 获取车辆轨迹数据
+            vehicle_data = self.left_turn_data[self.left_turn_data['vehicle_id'] == vehicle_id].sort_values('frame_id')
             
-            # 1. 轨迹图 (左上)
-            axes[0, 0].plot(vehicle_data['local_x'], vehicle_data['local_y'], 
-                           color=color, linewidth=3, alpha=0.8, 
-                           label=f'车辆 {vehicle_id}')
-            # 标记起点和终点
-            axes[0, 0].scatter(vehicle_data['local_x'].iloc[0], vehicle_data['local_y'].iloc[0], 
-                              color=color, s=150, marker='o', edgecolor='black', linewidth=2, zorder=5)
-            axes[0, 0].scatter(vehicle_data['local_x'].iloc[-1], vehicle_data['local_y'].iloc[-1], 
-                              color=color, s=150, marker='s', edgecolor='black', linewidth=2, zorder=5)
+            if len(vehicle_data) < 2:
+                continue
             
-            # 2. 速度变化 (右上)
-            axes[0, 1].plot(time_steps, vehicle_data['v_vel'], 
-                           color=color, linewidth=2, alpha=0.8, 
-                           label=f'车辆 {vehicle_id}')
-            
-            # 3. 航向角变化 (中上) - 基于位置计算
-            if 'local_x' in vehicle_data.columns and 'local_y' in vehicle_data.columns:
-                dx = vehicle_data['local_x'].diff().fillna(0)
-                dy = vehicle_data['local_y'].diff().fillna(0)
-                headings = np.degrees(np.arctan2(dy, dx))
-                axes[0, 2].plot(time_steps, headings, 
-                               color=color, linewidth=2, alpha=0.8, 
-                               label=f'车辆 {vehicle_id}')
-            
-            # 4. 加速度变化 (左下)
-            axes[1, 0].plot(time_steps, vehicle_data['v_acc'], 
-                           color=color, linewidth=2, alpha=0.8, 
-                           label=f'车辆 {vehicle_id}')
-            
-            # 5. X-Y坐标随时间变化 (右下)
-            axes[1, 1].plot(time_steps, vehicle_data['local_x'], 
-                           color=color, linewidth=2, alpha=0.8, linestyle='-',
-                           label=f'车辆 {vehicle_id} X')
-            axes[1, 1].plot(time_steps, vehicle_data['local_y'], 
-                           color=color, linewidth=2, alpha=0.6, linestyle='--')
-        
-        # 设置图表标题和标签
-        axes[0, 0].set_title('左转车辆轨迹 (○起点 ■终点)', fontsize=14, fontweight='bold')
-        axes[0, 0].set_xlabel('X坐标 (m)')
-        axes[0, 0].set_ylabel('Y坐标 (m)')
-        axes[0, 0].grid(True, alpha=0.3)
-        axes[0, 0].legend()
-        axes[0, 0].axis('equal')
-        
-        axes[0, 1].set_title('速度变化曲线', fontsize=14, fontweight='bold')
-        axes[0, 1].set_xlabel('时间步')
-        axes[0, 1].set_ylabel('速度 (m/s)')
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].legend()
-        
-        axes[0, 2].set_title('航向角变化曲线', fontsize=14, fontweight='bold')
-        axes[0, 2].set_xlabel('时间步')
-        axes[0, 2].set_ylabel('航向角 (度)')
-        axes[0, 2].grid(True, alpha=0.3)
-        axes[0, 2].legend()
-        
-        axes[1, 0].set_title('加速度变化曲线', fontsize=14, fontweight='bold')
-        axes[1, 0].set_xlabel('时间步')
-        axes[1, 0].set_ylabel('加速度 (m/s²)')
-        axes[1, 0].grid(True, alpha=0.3)
-        axes[1, 0].legend()
-        
-        axes[1, 1].set_title('坐标随时间变化 (实线X, 虚线Y)', fontsize=14, fontweight='bold')
-        axes[1, 1].set_xlabel('时间步')
-        axes[1, 1].set_ylabel('坐标 (m)')
-        axes[1, 1].grid(True, alpha=0.3)
-        axes[1, 1].legend()
-        
-        # 6. 特征统计对比 (中下)
-        if hasattr(self, 'sample_features') and self.sample_features:
-            feature_names = ['平均速度\n(m/s)', '最大速度\n(m/s)', '平均加速度\n(m/s²)', '航向角变化\n(度)', '轨迹长度\n(步数)']
-            avg_values = [
-                np.mean([f['avg_speed'] for f in self.sample_features]),
-                np.mean([f['max_speed'] for f in self.sample_features]),
-                np.mean([f['avg_acceleration'] for f in self.sample_features]),
-                np.mean([abs(f['heading_change']) for f in self.sample_features]),
-                np.mean([f['trajectory_length'] for f in self.sample_features])
-            ]
-            
-            bars = axes[1, 2].bar(feature_names, avg_values, 
-                                 color=['skyblue', 'lightgreen', 'lightcoral', 'gold', 'plum'])
-            axes[1, 2].set_title('左转车辆特征统计', fontsize=14, fontweight='bold')
-            axes[1, 2].set_ylabel('数值')
-            
-            # 在柱状图上添加数值标签
-            for bar, value in zip(bars, avg_values):
-                axes[1, 2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(avg_values)*0.01, 
-                               f'{value:.2f}', ha='center', va='bottom', fontweight='bold')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'left_turn_trajectories_analysis.png'), dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        print(f"轨迹可视化图表已保存到: {output_dir}/left_turn_trajectories_analysis.png")
-    
-    def generate_detailed_report(self, output_dir='left_turn_analysis'):
-        """生成详细分析报告"""
-        if not self.sample_features:
-            print("请先进行特征分析")
-            return
-        
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        
-        report_path = os.path.join(output_dir, 'left_turn_analysis_report.txt')
-        
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("=" * 60 + "\n")
-            f.write("左转车辆轨迹预测 - 数据筛选与特征分析报告\n")
-            f.write("=" * 60 + "\n\n")
-            
-            f.write("1. 数据概览\n")
-            f.write("-" * 30 + "\n")
-            f.write(f"数据文件: {self.data_path}\n")
-            f.write(f"总车辆数: {len(self.raw_data['vehicle_id'].unique())}\n")
-            f.write(f"左转车辆数: {len(self.left_turn_data['vehicle_id'].unique())}\n")
-            f.write(f"左转车辆占比: {len(self.left_turn_data['vehicle_id'].unique())/len(self.raw_data['vehicle_id'].unique())*100:.2f}%\n")
-            f.write(f"分析样例数: {len(self.sample_vehicles)}\n\n")
-            
-            f.write("2. 样例车辆详细特征\n")
-            f.write("-" * 30 + "\n")
-            
-            for i, features in enumerate(self.sample_features):
-                f.write(f"\n车辆 {features['vehicle_id']}:\n")
-                f.write(f"  轨迹长度: {features['trajectory_length']} 个时间步\n")
-                f.write(f"  持续时间: {features['duration']:.1f} 秒\n")
-                f.write(f"  速度统计: 平均 {features['avg_speed']:.2f} m/s (标准差 {features['speed_std']:.2f})\n")
-                f.write(f"  速度范围: [{features['min_speed']:.2f}, {features['max_speed']:.2f}] m/s\n")
-                f.write(f"  加速度统计: 平均 {features['avg_acceleration']:.2f} m/s² (标准差 {features['acc_std']:.2f})\n")
-                f.write(f"  加速度范围: [{features['min_acceleration']:.2f}, {features['max_acceleration']:.2f}] m/s²\n")
-                f.write(f"  航向角变化: {features['heading_start']:.1f}° → {features['heading_end']:.1f}° (变化 {features['heading_change']:.1f}°)\n")
-                f.write(f"  起点坐标: ({features['start_x']:.1f}, {features['start_y']:.1f}) m\n")
-                f.write(f"  终点坐标: ({features['end_x']:.1f}, {features['end_y']:.1f}) m\n")
-                f.write(f"  直线距离: {features['total_distance']:.2f} m\n")
-                f.write(f"  路径长度: {features['path_length']:.2f} m\n")
-                f.write(f"  路径曲率: {features['path_length']/features['total_distance']:.2f}\n")
-            
-            f.write("\n3. 统计汇总\n")
-            f.write("-" * 30 + "\n")
-            
-            # 计算统计指标
-            avg_speed = np.mean([f['avg_speed'] for f in self.sample_features])
-            avg_acc = np.mean([f['avg_acceleration'] for f in self.sample_features])
-            avg_heading_change = np.mean([abs(f['heading_change']) for f in self.sample_features])
-            avg_trajectory_length = np.mean([f['trajectory_length'] for f in self.sample_features])
-            avg_duration = np.mean([f['duration'] for f in self.sample_features])
-            
-            f.write(f"平均速度: {avg_speed:.2f} m/s\n")
-            f.write(f"平均加速度: {avg_acc:.2f} m/s²\n")
-            f.write(f"平均航向角变化: {avg_heading_change:.2f}°\n")
-            f.write(f"平均轨迹长度: {avg_trajectory_length:.1f} 个时间步\n")
-            f.write(f"平均持续时间: {avg_duration:.1f} 秒\n")
-            
-            f.write("\n4. 输出文件\n")
-            f.write("-" * 30 + "\n")
-            f.write(f"特征数据: {output_dir}/left_turn_sample_features.csv\n")
-            f.write(f"轨迹可视化: {output_dir}/left_turn_trajectories_analysis.png\n")
-            f.write(f"分析报告: {output_dir}/left_turn_analysis_report.txt\n")
-            
-            f.write("\n" + "=" * 60 + "\n")
-            f.write("报告生成完成\n")
-            f.write("=" * 60 + "\n")
-        
-        print(f"详细分析报告已保存到: {report_path}")
-    
-    def export_processed_data(self, output_dir='left_turn_analysis'):
-        """导出预处理后的左转数据，供深度学习框架使用"""
-        if self.left_turn_data is None or len(self.left_turn_data) == 0:
-            print("没有左转数据可导出")
-            return False
-        
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        
-        # 导出完整的左转数据
-        export_path = os.path.join(output_dir, 'processed_left_turn_data.csv')
-        
-        # 添加质量标记和特征
-        export_data = self.left_turn_data.copy()
-        
-        # 为每个车辆添加质量评估
-        vehicle_quality = {}
-        for vehicle_id in export_data['vehicle_id'].unique():
-            vehicle_data = export_data[export_data['vehicle_id'] == vehicle_id]
-            
-            # 计算数据质量指标
-            trajectory_length = len(vehicle_data)
+            # 绘制轨迹
             x_coords = vehicle_data['local_x'].values
             y_coords = vehicle_data['local_y'].values
             
-            # 计算轨迹平滑度
-            dx = np.diff(x_coords)
-            dy = np.diff(y_coords)
-            distances = np.sqrt(dx**2 + dy**2)
-            smoothness = np.std(distances) if len(distances) > 0 else 0
+            # 轨迹线
+            ax.plot(x_coords, y_coords, 'b-', linewidth=2, alpha=0.7, label='轨迹')
             
-            # 计算总航向角变化
-            total_heading_change = self.calculate_total_heading_change(vehicle_data)
+            # 起点和终点
+            ax.plot(x_coords[0], y_coords[0], 'go', markersize=8, label='起点')
+            ax.plot(x_coords[-1], y_coords[-1], 'ro', markersize=8, label='终点')
             
-            # 计算空间跨度
-            x_range = x_coords.max() - x_coords.min()
-            y_range = y_coords.max() - y_coords.min()
-            spatial_span = max(x_range, y_range)
+            # 方向箭头
+            if len(x_coords) > 1:
+                for j in range(0, len(x_coords)-1, max(1, len(x_coords)//10)):
+                    dx = x_coords[j+1] - x_coords[j]
+                    dy = y_coords[j+1] - y_coords[j]
+                    if dx != 0 or dy != 0:
+                        ax.arrow(x_coords[j], y_coords[j], dx*0.3, dy*0.3, 
+                                head_width=1, head_length=1, fc='red', ec='red', alpha=0.6)
             
-            vehicle_quality[vehicle_id] = {
-                'trajectory_length': trajectory_length,
-                'smoothness': smoothness,
-                'total_heading_change': abs(total_heading_change),
-                'spatial_span': spatial_span,
-                'is_high_quality': (
-                    trajectory_length >= 50 and 
-                    smoothness < 10 and 
-                    60 <= abs(total_heading_change) <= 120 and
-                    spatial_span < 200
-                )
-            }
+            # 设置标题和标签
+            maneuver_type = self.maneuver_classification.get(vehicle_id, 'unknown')
+            ax.set_title(f'车辆 {vehicle_id}\n机动类型: {maneuver_type}', fontsize=10)
+            ax.set_xlabel('X坐标 (m)')
+            ax.set_ylabel('Y坐标 (m)')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8)
+            
+            # 设置坐标轴范围
+            margin = 10
+            ax.set_xlim(min(x_coords) - margin, max(x_coords) + margin)
+            ax.set_ylim(min(y_coords) - margin, max(y_coords) + margin)
         
-        # 添加质量标记到导出数据
-        export_data['is_high_quality'] = export_data['vehicle_id'].map(
-            lambda x: vehicle_quality[x]['is_high_quality']
-        )
-        export_data['trajectory_length'] = export_data['vehicle_id'].map(
-            lambda x: vehicle_quality[x]['trajectory_length']
-        )
-        export_data['smoothness'] = export_data['vehicle_id'].map(
-            lambda x: vehicle_quality[x]['smoothness']
-        )
-        export_data['total_heading_change'] = export_data['vehicle_id'].map(
-            lambda x: vehicle_quality[x]['total_heading_change']
-        )
-        export_data['spatial_span'] = export_data['vehicle_id'].map(
-            lambda x: vehicle_quality[x]['spatial_span']
-        )
+        # 隐藏多余的子图
+        for i in range(len(self.sample_vehicles), 6):
+            axes[i].set_visible(False)
+        
+        # 设置总标题
+        entrance_info = ""
+        if self.selected_entrance:
+            entrance_info = f" - {self.selected_entrance['direction_name']}"
+        
+        plt.suptitle(f'路口 {self.intersection_id} 左转车辆轨迹分析{entrance_info}', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        
+        # 保存图形
+        os.makedirs(output_dir, exist_ok=True)
+        plot_file = os.path.join(output_dir, f'intersection_{self.intersection_id}_left_turn_trajectories_analysis.png')
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✅ 轨迹可视化完成，已保存到: {plot_file}")
+    
+    def generate_detailed_report(self, output_dir: str):
+        """生成详细的分析报告"""
+        print(f"\n📝 生成详细分析报告...")
+        
+        os.makedirs(output_dir, exist_ok=True)
+        report_file = os.path.join(output_dir, f'intersection_{self.intersection_id}_left_turn_analysis_report.txt')
+        
+        with open(report_file, 'w', encoding='utf-8') as f:
+            f.write("="*80 + "\n")
+            f.write(f"路口 {self.intersection_id} 左转车辆分析报告\n")
+            f.write("="*80 + "\n\n")
+            
+            # 基本信息
+            f.write("1. 基本信息\n")
+            f.write("-"*40 + "\n")
+            f.write(f"数据文件: {self.data_path}\n")
+            f.write(f"路口ID: {self.intersection_id}\n")
+            
+            if self.selected_entrance:
+                f.write(f"分析入口: {self.selected_entrance['direction_name']}\n")
+                f.write(f"入口方向: {self.selected_entrance['direction']}\n")
+            else:
+                f.write("分析范围: 所有入口方向\n")
+            
+            f.write(f"分析时间: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            # 数据统计
+            f.write("2. 数据统计\n")
+            f.write("-"*40 + "\n")
+            if self.raw_data is not None:
+                f.write(f"总记录数: {len(self.raw_data):,}\n")
+                f.write(f"总车辆数: {self.raw_data['vehicle_id'].nunique()}\n")
+            
+            if self.left_turn_data is not None:
+                f.write(f"左转记录数: {len(self.left_turn_data):,}\n")
+                f.write(f"左转车辆数: {self.left_turn_data['vehicle_id'].nunique()}\n")
+            
+            f.write(f"样例车辆数: {len(self.sample_vehicles)}\n\n")
+            
+            # 入口分析结果
+            if self.entrance_analysis:
+                f.write("3. 入口分析结果\n")
+                f.write("-"*40 + "\n")
+                for key, stats in self.entrance_analysis.items():
+                    f.write(f"{stats['direction_name']}:\n")
+                    f.write(f"  总车辆: {stats['total_vehicles']} 辆\n")
+                    f.write(f"  左转车辆: {stats['left_turn_vehicles']} 辆\n")
+                    f.write(f"  左转比例: {stats['left_turn_ratio']:.1f}%\n")
+                    f.write(f"  总记录: {stats['total_records']} 条\n\n")
+            
+            # 机动分类统计
+            if self.maneuver_classification:
+                f.write("4. 机动分类统计\n")
+                f.write("-"*40 + "\n")
+                maneuver_counts = {}
+                for maneuver in self.maneuver_classification.values():
+                    maneuver_counts[maneuver] = maneuver_counts.get(maneuver, 0) + 1
+                
+                total_vehicles = len(self.maneuver_classification)
+                for maneuver, count in sorted(maneuver_counts.items()):
+                    percentage = count / total_vehicles * 100
+                    f.write(f"{maneuver}: {count} 辆 ({percentage:.1f}%)\n")
+                f.write("\n")
+            
+            # 参数配置
+            f.write("5. 参数配置\n")
+            f.write("-"*40 + "\n")
+            for key, value in self.params.items():
+                f.write(f"{key}: {value}\n")
+            f.write("\n")
+            
+            # 样例车辆详情
+            if self.sample_vehicles and self.sample_features is not None:
+                f.write("6. 样例车辆详情\n")
+                f.write("-"*40 + "\n")
+                for _, row in self.sample_features.iterrows():
+                    f.write(f"车辆 {row['vehicle_id']}:\n")
+                    f.write(f"  轨迹长度: {row['trajectory_length']} 点\n")
+                    f.write(f"  持续时间: {row['duration_frames']} 帧\n")
+                    f.write(f"  平均速度: {row['avg_speed']:.2f} m/s\n")
+                    f.write(f"  角度变化: {row['total_angle_change']:.1f}°\n")
+                    f.write(f"  平均曲率: {row['avg_curvature']:.6f}\n")
+                    f.write(f"  机动类型: {row['maneuver_type']}\n")
+                    f.write(f"  入口方向: {row['entrance_name']}\n\n")
+            
+            f.write("="*80 + "\n")
+            f.write("报告生成完成\n")
+            f.write("="*80 + "\n")
+        
+        print(f"✅ 分析报告生成完成，已保存到: {report_file}")
+    
+    def export_processed_data(self, output_dir: str):
+        """导出处理后的数据供深度学习使用"""
+        if self.left_turn_data is None:
+            print("❌ 没有左转数据可供导出")
+            return
+        
+        print(f"\n💾 导出处理后的左转数据...")
+        
+        # 创建输出目录
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 添加机动分类信息
+        export_data = self.left_turn_data.copy()
+        export_data['predicted_maneuver'] = export_data['vehicle_id'].map(self.maneuver_classification)
+        
+        # 添加入口信息
+        if self.selected_entrance:
+            export_data['selected_entrance'] = self.selected_entrance['direction_name']
+            export_data['selected_entrance_direction'] = self.selected_entrance['direction']
+        
+        # 添加样例标记
+        export_data['is_sample'] = export_data['vehicle_id'].isin(self.sample_vehicles)
         
         # 保存数据
-        export_data.to_csv(export_path, index=False)
+        data_file = os.path.join(output_dir, f'intersection_{self.intersection_id}_processed_left_turn_data.csv')
+        export_data.to_csv(data_file, index=False, encoding='utf-8-sig')
         
-        # 统计信息
-        total_vehicles = len(export_data['vehicle_id'].unique())
-        high_quality_vehicles = len([v for v in vehicle_quality.values() if v['is_high_quality']])
+        print(f"✅ 处理后数据导出完成，已保存到: {data_file}")
         
-        print(f"{'='*50}")
-        print("数据导出完成！")
-        print(f"导出文件: {export_path}")
-        print(f"总车辆数: {total_vehicles}")
-        print(f"高质量车辆数: {high_quality_vehicles} ({high_quality_vehicles/total_vehicles*100:.1f}%)")
-        print(f"总数据点: {len(export_data)}")
-        print("="*50)
+        # 生成数据质量报告
+        quality_report_file = os.path.join(output_dir, f'intersection_{self.intersection_id}_data_quality_report.txt')
         
-        # 保存质量统计报告
-        quality_report_path = os.path.join(output_dir, 'data_quality_report.txt')
-        with open(quality_report_path, 'w', encoding='utf-8') as f:
-            f.write("左转数据质量报告")
-            f.write("="*50 + "")
-            f.write(f"总车辆数: {total_vehicles}")
-            f.write(f"高质量车辆数: {high_quality_vehicles}")
-            f.write(f"高质量比例: {high_quality_vehicles/total_vehicles*100:.1f}%")
-            f.write(f"总数据点: {len(export_data)}")
+        with open(quality_report_file, 'w', encoding='utf-8') as f:
+            f.write("数据质量报告\n")
+            f.write("="*50 + "\n\n")
             
-            f.write("质量标准:")
-            f.write("- 轨迹长度 >= 50 个点")
-            f.write("- 轨迹平滑度 < 10")
-            f.write("- 航向角变化 60°-120°")
-            f.write("- 空间跨度 < 200米")
+            f.write(f"总记录数: {len(export_data):,}\n")
+            f.write(f"车辆数: {export_data['vehicle_id'].nunique()}\n")
+            f.write(f"样例车辆数: {export_data['is_sample'].sum()}\n\n")
             
-            f.write("导出数据列说明:")
-            f.write("- vehicle_id: 车辆ID")
-            f.write("- frame_id: 帧ID")
-            f.write("- local_x, local_y: 车辆坐标")
-            f.write("- is_high_quality: 是否为高质量数据")
-            f.write("- trajectory_length: 轨迹长度")
-            f.write("- smoothness: 轨迹平滑度")
-            f.write("- total_heading_change: 总航向角变化")
-            f.write("- spatial_span: 空间跨度")
+            # 轨迹长度分布
+            trajectory_lengths = export_data.groupby('vehicle_id').size()
+            f.write("轨迹长度统计:\n")
+            f.write(f"  平均长度: {trajectory_lengths.mean():.1f} 点\n")
+            f.write(f"  最短轨迹: {trajectory_lengths.min()} 点\n")
+            f.write(f"  最长轨迹: {trajectory_lengths.max()} 点\n")
+            f.write(f"  标准差: {trajectory_lengths.std():.1f} 点\n\n")
+            
+            # 速度统计
+            if 'v_vel' in export_data.columns:
+                f.write("速度统计:\n")
+                f.write(f"  平均速度: {export_data['v_vel'].mean():.2f} m/s\n")
+                f.write(f"  最大速度: {export_data['v_vel'].max():.2f} m/s\n")
+                f.write(f"  最小速度: {export_data['v_vel'].min():.2f} m/s\n")
+                f.write(f"  速度标准差: {export_data['v_vel'].std():.2f} m/s\n\n")
+            
+            # 机动分类分布
+            if 'predicted_maneuver' in export_data.columns:
+                maneuver_dist = export_data.groupby('vehicle_id')['predicted_maneuver'].first().value_counts()
+                f.write("机动分类分布:\n")
+                for maneuver, count in maneuver_dist.items():
+                    percentage = count / len(maneuver_dist) * 100
+                    f.write(f"  {maneuver}: {count} 辆 ({percentage:.1f}%)\n")
         
-        print(f"质量报告已保存到: {quality_report_path}")
-        return True
+        print(f"✅ 数据质量报告生成完成，已保存到: {quality_report_file}")
     
-    def run_complete_analysis(self, num_samples=5, output_dir='left_turn_analysis'):
-        """运行完整的左转数据分析流程"""
-        print("开始左转车辆数据筛选和轨迹分析...")
+    def run_complete_analysis(self, num_samples: int = 5, output_dir: str = None) -> bool:
+        """运行完整的左转车辆分析流程"""
+        print("🚀 开始完整的左转车辆分析...")
+        print("="*60)
+        
+        if output_dir is None:
+            output_dir = f'intersection_{self.intersection_id}_left_turn_analysis'
+        
+        # 显示参数配置
+        self.print_parameters()
         
         # 1. 加载数据
         if not self.load_data():
@@ -1034,7 +1063,7 @@ class LeftTurnAnalyzer:
         
         # 4. 分析特征
         self.sample_features = self.analyze_sample_features(output_dir)
-        if not self.sample_features:
+        if self.sample_features is None or self.sample_features.empty:
             return False
         
         # 5. 可视化轨迹
@@ -1043,19 +1072,121 @@ class LeftTurnAnalyzer:
         # 6. 生成报告
         self.generate_detailed_report(output_dir)
         
-        print(f"\n{'='*50}")
-        print("左转车辆分析完成！")
+        # 7. 导出处理后的数据
+        self.export_processed_data(output_dir)
+        
+        print(f"\n{'='*60}")
+        print(f"🎉 路口 {self.intersection_id} 左转车辆分析完成！")
         print("输出文件:")
-        print(f"  - {output_dir}/left_turn_sample_features.csv")
-        print(f"  - {output_dir}/left_turn_trajectories_analysis.png")
-        print(f"  - {output_dir}/left_turn_analysis_report.txt")
-        print("="*50)
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_left_turn_sample_features.csv")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_left_turn_trajectories_analysis.png")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_left_turn_analysis_report.txt")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_processed_left_turn_data.csv")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_data_quality_report.txt")
+        print("="*60)
+        
+        return True
+    
+    def run_entrance_analysis(self, num_samples=5, output_dir=None):
+        """运行入口分析流程 - 解决问题3，并继续完整分析"""
+        print("🔍 开始入口分析流程...")
+        print("="*60)
+        
+        # 1. 先加载完整数据来发现路口
+        if not self.load_data():
+            return False
+        
+        # 2. 发现所有路口
+        if not self.analyze_all_intersections():
+            return False
+        
+        # 3. 选择路口
+        if not self.select_intersection_interactive():
+            return False
+        
+        # 4. 重新加载选定路口的数据
+        if not self.load_data():
+            return False
+        
+        # 5. 分析入口
+        entrance_stats = self.analyze_intersection_entrances()
+        if not entrance_stats:
+            return False
+        
+        # 6. 选择入口
+        if not self.select_entrance_for_analysis():
+            return False
+        
+        # 7. 过滤数据
+        if not self.filter_entrance_data():
+            return False
+        
+        print("✅ 入口分析完成！")
+        print("已筛选出指定入口的左转车辆数据，现在开始详细分析...")
+        
+        # 8. 继续进行完整的左转分析流程
+        print("\n" + "="*60)
+        print("🚀 开始详细的左转车辆轨迹分析...")
+        print("="*60)
+        
+        if output_dir is None:
+            if self.selected_entrance:
+                entrance_name = self.selected_entrance['direction_name'].replace(' ', '_').replace('(', '').replace(')', '')
+                output_dir = f'intersection_{self.intersection_id}_{entrance_name}_left_turn_analysis'
+            else:
+                output_dir = f'intersection_{self.intersection_id}_all_entrances_left_turn_analysis'
+        
+        # 显示参数配置
+        self.print_parameters()
+        
+        # 8. 识别左转车辆
+        if not self.identify_left_turn_vehicles():
+            print("⚠️ 左转车辆识别失败，但继续使用已筛选的数据")
+            # 如果识别失败，使用已经筛选的左转车辆数据
+            self.left_turn_data = self.raw_data
+        
+        # 9. 选择样例车辆
+        if not self.select_sample_vehicles(num_samples):
+            print("⚠️ 样例车辆选择失败")
+            return False
+        
+        # 10. 分析特征
+        self.sample_features = self.analyze_sample_features(output_dir)
+        if self.sample_features is None or self.sample_features.empty:
+            print("⚠️ 特征分析失败")
+            return False
+        
+        # 11. 可视化轨迹
+        self.visualize_trajectories(output_dir)
+        
+        # 12. 生成报告
+        self.generate_detailed_report(output_dir)
+        
+        # 13. 导出处理后的数据
+        self.export_processed_data(output_dir)
+        
+        print(f"\n{'='*60}")
+        print(f"🎉 路口 {self.intersection_id} 入口分析和左转车辆分析完成！")
+        if self.selected_entrance:
+            print(f"分析入口: {self.selected_entrance['direction_name']}")
+        else:
+            print("分析范围: 所有入口方向")
+        print("输出文件:")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_left_turn_sample_features.csv")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_left_turn_trajectories_analysis.png")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_left_turn_analysis_report.txt")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_processed_left_turn_data.csv")
+        print(f"  - {output_dir}/intersection_{self.intersection_id}_data_quality_report.txt")
+        print("="*60)
         
         return True
 
 
 def main():
     """主函数"""
+    print("🎯 左转车辆数据筛选和轨迹分析脚本 - 支持多路口分析")
+    print("="*60)
+    
     # 数据文件路径
     data_path = input("请输入NGSIM数据文件路径 (默认: ../data/peachtree_filtered_data.csv): ").strip()
     if not data_path:
@@ -1063,19 +1194,51 @@ def main():
     
     # 检查文件是否存在
     if not os.path.exists(data_path):
-        print(f"错误: 文件 {data_path} 不存在")
+        print(f"❌ 错误: 文件 {data_path} 不存在")
         print("请确保数据文件路径正确")
         return
     
-    # 样例数量
-    try:
-        num_samples = int(input("请输入要分析的样例车辆数量 (默认: 5): ").strip() or "5")
-    except ValueError:
-        num_samples = 5
+    # 选择分析模式
+    print("\n请选择分析模式:")
+    print("1 - 入口分析模式 (解决问题3: 区分路口入口)")
+    print("2 - 标准左转分析模式")
     
-    # 创建分析器并运行分析
-    analyzer = LeftTurnAnalyzer(data_path)
-    analyzer.run_complete_analysis(num_samples=num_samples)
+    try:
+        mode = int(input("请选择模式 (默认: 1): ").strip() or "1")
+    except ValueError:
+        mode = 1
+    
+    if mode == 1:
+        # 入口分析模式
+        # 样例数量
+        try:
+            num_samples = int(input("请输入要分析的样例车辆数量 (默认: 5): ").strip() or "5")
+        except ValueError:
+            num_samples = 5
+        
+        analyzer = LeftTurnAnalyzer(data_path)
+        analyzer.run_entrance_analysis(num_samples=num_samples)
+    else:
+        # 标准分析模式
+        print("\n可选择的路口:")
+        print("1 - 路口1 (优化参数: 召回率优先，基于测试结果调整)")
+        print("2 - 路口2 (标准参数)")
+        print("其他 - 使用默认参数")
+        
+        try:
+            intersection_id = int(input("请选择路口ID (默认: 1): ").strip() or "1")
+        except ValueError:
+            intersection_id = 1
+        
+        # 样例数量
+        try:
+            num_samples = int(input("请输入要分析的样例车辆数量 (默认: 5): ").strip() or "5")
+        except ValueError:
+            num_samples = 5
+        
+        # 创建分析器并运行分析
+        analyzer = LeftTurnAnalyzer(data_path, intersection_id=intersection_id)
+        analyzer.run_complete_analysis(num_samples=num_samples)
 
 
 if __name__ == "__main__":
