@@ -304,7 +304,7 @@ class MultiModalDataset(Dataset):
                     })
                     
                     # 如果达到最大样本数限制，提前结束
-                    if self.max_samples and len(samples) >= self.max_samples:
+                    if self.max_samples>0 and len(samples) >= self.max_samples:
                         print(f"🔄 已达到最大样本数限制 ({self.max_samples}个样本)")
                         pbar.update(total_vehicles - pbar.n)  # 更新进度条到100%
                         return samples[:self.max_samples]
@@ -533,13 +533,13 @@ class MultiModalDataset(Dataset):
             return 1.0
     
     def analyze_dataset(self):
-        """分析数据集统计信息"""
+        """分析数据集统计信息，包括速度、加速度、航向角等关键特征统计"""
         if self.use_prediction_mode and hasattr(self, 'samples'):
             print(f"📊 预测数据集分析:")
             print(f"   总样本数: {len(self.samples):,}")
             
             # 使用进度条进行数据分析
-            with tqdm(total=4, desc="分析进度", unit="项") as pbar:
+            with tqdm(total=5, desc="分析进度", unit="项") as pbar:
                 # 标签分布
                 labels = [sample['label'] for sample in self.samples]
                 left_turn_count = sum(labels)
@@ -576,11 +576,63 @@ class MultiModalDataset(Dataset):
                         max_x, max_y = np.max(positions_array, axis=0)
                         print(f"   轨迹空间范围: x[{min_x:.1f}, {max_x:.1f}], y[{min_y:.1f}, {max_y:.1f}]")
                 pbar.update(1)
+                
+                # 关键特征统计分析 (只分析前1000个样本以提高效率)
+                if len(self.samples) > 0:
+                    print("   关键运动特征统计分析:")
+                    # 存储所有样本的速度、加速度和航向角
+                    speeds = []
+                    accelerations = []
+                    headings = []
+                    
+                    # 分析前1000个样本
+                    sample_limit = min(1000, len(self.samples))
+                    for i in range(sample_limit):
+                        sample = self.samples[i]
+                        history_data = sample['history_data']
+                        
+                        # 提取速度特征
+                        if 'v_vel' in history_data.columns:
+                            speeds.extend(history_data['v_vel'].values)
+                        
+                        # 提取加速度特征
+                        if 'v_acc' in history_data.columns:
+                            accelerations.extend(history_data['v_acc'].values)
+                        
+                        # 计算航向角 (如果数据中没有直接提供)
+                        if 'local_x' in history_data.columns and 'local_y' in history_data.columns:
+                            positions = history_data[['local_x', 'local_y']].values
+                            if len(positions) >= 2:
+                                dx = np.diff(positions[:, 0])
+                                dy = np.diff(positions[:, 1])
+                                heading = np.arctan2(dy, dx)  # 弧度制
+                                headings.extend(heading)
+                    
+                    # 输出速度统计
+                    if speeds:
+                        speeds = np.array(speeds)
+                        print(f"     速度统计: 均值={np.mean(speeds):.2f} m/s, 标准差={np.std(speeds):.2f} m/s, ")
+                        print(f"              最小值={np.min(speeds):.2f} m/s, 最大值={np.max(speeds):.2f} m/s")
+                    
+                    # 输出加速度统计
+                    if accelerations:
+                        accelerations = np.array(accelerations)
+                        print(f"     加速度统计: 均值={np.mean(accelerations):.2f} m/s², 标准差={np.std(accelerations):.2f} m/s², ")
+                        print(f"                最小值={np.min(accelerations):.2f} m/s², 最大值={np.max(accelerations):.2f} m/s²")
+                    
+                    # 输出航向角统计
+                    if headings:
+                        headings = np.array(headings)
+                        # 转换为角度制以便于理解
+                        headings_deg = np.rad2deg(headings)
+                        print(f"     航向角统计: 均值={np.mean(headings_deg):.2f}°, 标准差={np.std(headings_deg):.2f}°, ")
+                        print(f"                最小值={np.min(headings_deg):.2f}°, 最大值={np.max(headings_deg):.2f}°")
+                pbar.update(1)
         else:
             print(f"📊 传统数据集分析:")
             print(f"   数据记录数: {len(self.data):,}")
             
-            with tqdm(total=2, desc="分析进度", unit="项") as pbar:
+            with tqdm(total=3, desc="分析进度", unit="项") as pbar:
                 # 车辆统计
                 print(f"   车辆数: {len(self.data['vehicle_id'].unique()):,}")
                 pbar.update(1)
@@ -592,6 +644,62 @@ class MultiModalDataset(Dataset):
                     for movement, count in movement_counts.items():
                         movement_name = {1.0: '直行', 2.0: '左转', 3.0: '右转'}.get(movement, f'其他({movement})')
                         print(f"     {movement_name}: {count:,} ({count/len(self.data)*100:.1f}%)")
+                pbar.update(1)
+                
+                # 关键运动特征统计分析
+                print("   关键运动特征统计分析:")
+                
+                # 速度统计
+                if 'v_vel' in self.data.columns:
+                    speeds = self.data['v_vel'].values
+                    if len(speeds) > 0:
+                        speeds = np.array(speeds)
+                        print(f"     速度统计: 均值={np.mean(speeds):.2f} m/s, 标准差={np.std(speeds):.2f} m/s, ")
+                        print(f"              最小值={np.min(speeds):.2f} m/s, 最大值={np.max(speeds):.2f} m/s")
+                
+                # 加速度统计
+                if 'v_acc' in self.data.columns:
+                    accelerations = self.data['v_acc'].values
+                    if len(accelerations) > 0:
+                        accelerations = np.array(accelerations)
+                        print(f"     加速度统计: 均值={np.mean(accelerations):.2f} m/s², 标准差={np.std(accelerations):.2f} m/s², ")
+                        print(f"                最小值={np.min(accelerations):.2f} m/s², 最大值={np.max(accelerations):.2f} m/s²")
+                
+                # 航向角统计 (基于位置数据计算)
+                if 'local_x' in self.data.columns and 'local_y' in self.data.columns and 'vehicle_id' in self.data.columns:
+                    # 为每辆车计算航向角
+                    headings = []
+                    
+                    # 按车辆分组处理
+                    vehicle_groups = self.data.groupby('vehicle_id')
+                    
+                    # 限制分析的车辆数量以提高性能
+                    max_vehicles = 500  # 最多分析500辆车
+                    vehicle_count = 0
+                    
+                    for vehicle_id, vehicle_data in vehicle_groups:
+                        if vehicle_count >= max_vehicles:
+                            break
+                        
+                        # 按时间排序
+                        sorted_data = vehicle_data.sort_values('frame_id')
+                        positions = sorted_data[['local_x', 'local_y']].values
+                        
+                        # 计算航向角
+                        if len(positions) >= 2:
+                            dx = np.diff(positions[:, 0])
+                            dy = np.diff(positions[:, 1])
+                            heading = np.arctan2(dy, dx)  # 弧度制
+                            headings.extend(heading)
+                        
+                        vehicle_count += 1
+                    
+                    if headings:
+                        headings = np.array(headings)
+                        headings_deg = np.rad2deg(headings)
+                        print(f"     航向角统计: 均值={np.mean(headings_deg):.2f}°, 标准差={np.std(headings_deg):.2f}°, ")
+                        print(f"                最小值={np.min(headings_deg):.2f}°, 最大值={np.max(headings_deg):.2f}°")
+                
                 pbar.update(1)
 
 class VisualEncoder(nn.Module):
