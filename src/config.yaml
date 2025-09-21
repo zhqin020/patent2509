@@ -1,0 +1,10 @@
+# config.yaml
+raw_csv_file: "peachtree_filtered_data.csv"   # 原始 NGSIM 数据文件路径
+int_id: 1                   # 路口编号 (1-5)
+approach: 1      # 入口方向: northbound, southbound, eastbound, westbound
+history_length: 30          # 输入历史轨迹长度
+prediction_horizon: 12      # 预测未来轨迹长度
+batch_size: 32              # 训练批次大小
+device: "cpu"               # 训练设备: "cpu" 或 "cuda"
+max_samples: -1         # 最大样本数 -1: 全部样本
+epochs: 50                 # 训练轮数

@@ -139,7 +139,68 @@ class LeftTurnAnalyzer:
             if key != 'left_turn_region':
                 print(f"  {key}: {value}")
         print(f"  left_turn_region: {self.params['left_turn_region']}")
+        print("  左转检测范围限制: 距离路口≤200米，转弯时间≤60秒")
         print("="*50)
+    
+    def check_intersection_spatial_constraints(self, vehicle_data: pd.DataFrame) -> str:
+        """检查路口空间约束 - 确保距离路口不超过200米"""
+        if len(vehicle_data) < 10:  # 至少需要10个数据点
+            return "insufficient_data"
+        
+        x_coords = vehicle_data['local_x'].values
+        y_coords = vehicle_data['local_y'].values
+        
+        # 计算轨迹的几何中心（转角顶点的近似位置）
+        center_x = float(np.mean(x_coords))
+        center_y = float(np.mean(y_coords))
+        
+        # 计算所有点到中心的距离
+        distances_to_center = np.sqrt((x_coords - center_x)**2 + (y_coords - center_y)** 2)
+        max_distance_to_center = np.max(distances_to_center)
+        
+        # 检查是否在200米范围内
+        if max_distance_to_center > 200:
+            return "out_of_intersection_range"
+        
+        # 通过空间约束检查
+        return "valid"
+    
+    def check_turn_time_constraint(self, vehicle_data: pd.DataFrame) -> str:
+        """检查转弯时间约束 - 确保转弯在1分钟内完成"""
+        if len(vehicle_data) < 10:
+            return "insufficient_data"
+        
+        # 假设frame_id表示时间帧，且帧率为10Hz (NGSIM数据通常是10Hz)
+        if 'frame_id' not in vehicle_data.columns:
+            return "valid"  # 如果没有frame_id列，跳过时间检查
+        
+        frame_ids = vehicle_data['frame_id'].values
+        min_frame = np.min(frame_ids)
+        max_frame = np.max(frame_ids)
+        
+        # 计算持续时间（秒）
+        duration_seconds = (max_frame - min_frame) / 10.0  # 转换为秒
+        
+        # 检查是否在60秒内
+        if duration_seconds > 60:
+            return "excessive_turn_duration"
+        
+        return "valid"
+    
+    def check_turn_limits(self, vehicle_data: pd.DataFrame) -> str:
+        """综合检查转弯的空间和时间限制"""
+        # 检查空间限制
+        spatial_result = self.check_intersection_spatial_constraints(vehicle_data)
+        if spatial_result != "valid":
+            return spatial_result
+        
+        # 检查时间限制
+        time_result = self.check_turn_time_constraint(vehicle_data)
+        if time_result != "valid":
+            return time_result
+        
+        # 所有限制检查通过
+        return "valid"
     
     def load_data(self) -> bool:
         """加载并预处理数据"""
@@ -172,7 +233,11 @@ class LeftTurnAnalyzer:
                 self.raw_data = self.raw_data[self.raw_data['lane_id'] == self.entrance_lane]
                 print(f"✅ 已过滤入口车道 {self.entrance_lane}")
             
-            print(f"✅ 已过滤路口 {self.intersection_id} 相关车辆数据: {len(self.raw_data)}/{len(pd.read_csv(self.data_path))} 条记录")
+            # 正确显示最终过滤结果
+            if self.intersection_id is not None:
+                print(f"✅ 已过滤路口 {self.intersection_id} 相关车辆数据: {len(self.raw_data)}/{len(pd.read_csv(self.data_path))} 条记录")
+            else:
+                print(f"✅ 已加载并过滤数据: {len(self.raw_data)}/{len(pd.read_csv(self.data_path))} 条记录")
             print(f"包含 {self.raw_data['vehicle_id'].nunique()} 辆车辆")
             
             return True
@@ -457,6 +522,37 @@ class LeftTurnAnalyzer:
                 angles.append(angle)
         
         return np.sum(angles) if angles else 0.0
+        
+    def calculate_total_heading_change(self, vehicle_data: pd.DataFrame) -> float:
+        """计算车辆航向角的总变化量
+        与轨迹角度变化计算类似，用于数据预处理中的特征提取
+        """
+        if len(vehicle_data) < 3:
+            return 0.0
+        
+        # 按时间排序
+        traj = vehicle_data.sort_values('frame_id')
+        
+        angles = []
+        for i in range(1, len(traj) - 1):
+            # 计算前后两段的方向向量
+            x1, y1 = traj.iloc[i-1][['local_x', 'local_y']]
+            x2, y2 = traj.iloc[i][['local_x', 'local_y']]
+            x3, y3 = traj.iloc[i+1][['local_x', 'local_y']]
+            
+            # 向量1: (x1,y1) -> (x2,y2)
+            v1 = np.array([x2-x1, y2-y1])
+            # 向量2: (x2,y2) -> (x3,y3)
+            v2 = np.array([x3-x2, y3-y2])
+            
+            # 计算角度
+            if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
+                cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+                cos_angle = np.clip(cos_angle, -1, 1)  # 防止数值误差
+                angle = np.arccos(cos_angle) * 180 / np.pi
+                angles.append(angle)
+        
+        return np.sum(angles) if angles else 0.0
     
     def calculate_trajectory_curvature(self, trajectory_data: pd.DataFrame) -> float:
         """计算轨迹的平均曲率"""
@@ -492,7 +588,7 @@ class LeftTurnAnalyzer:
     
     def classify_vehicle_maneuver(self, vehicle_data: pd.DataFrame) -> str:
         """
-        精确分类车辆机动类型
+        精确分类车辆机动类型，包含左转检测范围限制
         
         Args:
             vehicle_data: 单个车辆的轨迹数据
@@ -505,6 +601,11 @@ class LeftTurnAnalyzer:
         
         # 按时间排序
         traj = vehicle_data.sort_values('frame_id').reset_index(drop=True)
+        
+        # 🚨 新增：转弯范围限制检查 - 调用统一的检查方法
+        # 距离路口不能超过200米，转弯应该在1分钟内完成
+        if not self.check_turn_limits(traj):
+            return 'insufficient_data'  # 超出限制范围
         
         # 1. 基于movement字段的直接判断（如果可用且可靠）
         if 'movement' in traj.columns:
@@ -597,12 +698,13 @@ class LeftTurnAnalyzer:
             return 'insufficient_data'
     
     def identify_left_turn_vehicles(self) -> bool:
-        """识别左转车辆"""
+        """识别左转车辆，并应用路口范围限制（200米内，60秒内）"""
         if self.raw_data is None:
             print("❌ 请先加载数据")
             return False
         
         print(f"\n🔍 开始识别左转车辆...")
+        print(f"   限制条件: 距离路口≤200米，转弯时间≤60秒")
         
         left_turn_vehicles = []
         vehicle_classifications = {}
@@ -618,6 +720,12 @@ class LeftTurnAnalyzer:
             
             # 获取车辆轨迹数据
             vehicle_data = self.raw_data[self.raw_data['vehicle_id'] == vehicle_id]
+            
+            # 检查转弯范围限制
+            turn_limit_check = self.check_turn_limits(vehicle_data)
+            if turn_limit_check != "valid":
+                vehicle_classifications[vehicle_id] = turn_limit_check
+                continue
             
             # 分类机动类型
             maneuver_type = self.classify_vehicle_maneuver(vehicle_data)
