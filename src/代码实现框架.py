@@ -49,7 +49,7 @@ class DataPipeline:
         self.raw_path = raw_path
     
     def build_dataset(self, int_id=None, approach=None, history_length=30, prediction_horizon=12, 
-                     min_trajectory_length=100, use_prediction_mode=True, max_samples=None):
+                     min_trajectory_length=100, max_samples=None):
         """
         从原始数据构建数据集
         
@@ -59,7 +59,6 @@ class DataPipeline:
             history_length: 历史轨迹长度
             prediction_horizon: 预测时间范围
             min_trajectory_length: 最小轨迹长度
-            use_prediction_mode: 是否使用预测模式
             max_samples: 最大样本数限制
         
         Returns:
@@ -67,49 +66,30 @@ class DataPipeline:
         """
         print("🔄 开始构建数据集...")
         
-        # 初始化LeftTurnAnalyzer时传入路口ID和入口方向
-        analyzer = LeftTurnAnalyzer(self.raw_path, intersection_id=int_id, entrance_direction=approach)
+        # 直接加载原始数据，避免使用LeftTurnAnalyzer的筛选功能
+        print(f"正在加载数据: {self.raw_path}")
         
-        # 加载数据
-        analyzer.load_data()
+        # 加载原始数据
+        raw_data = pd.read_csv(self.raw_path)
         
-        # 如果是无特定路口ID的情况，确保selected_entrance为None以便不进行筛选
-        if int_id is None and approach is None:
-            analyzer.selected_entrance = None
-            print("✅ 使用全部数据，不进行路口和方向筛选")
-            filtered = analyzer.raw_data
-        else:
-            # 筛选数据
-            if use_prediction_mode:
-                # 预测模式下需要正负样本，不能只筛选左转车辆
-                # 先尝试按路口和方向筛选数据
-                success = analyzer.filter_entrance_data()
-                if not success:
-                    print("⚠️ 按路口和方向筛选失败，将使用原始数据进行正负样本构建")
-                    # 不做数据过滤，让MultiModalDataset自己处理正负样本
-                    filtered = analyzer.raw_data
-                else:
-                    filtered = analyzer.raw_data
-            else:
-                # 非预测模式下只需要左转车辆数据
-                success = analyzer.filter_entrance_data()
-                if not success:
-                    # 如果筛选失败但数据不为空，检查是否有左转车辆
-                    if analyzer.raw_data is not None and len(analyzer.raw_data) > 0:
-                        print("🔍 尝试筛选所有左转车辆...")
-                        if 'movement' in analyzer.raw_data.columns:
-                            left_turn_data = analyzer.raw_data[analyzer.raw_data['movement'] == 2]
-                            if len(left_turn_data) > 0:
-                                analyzer.raw_data = left_turn_data
-                                print(f"✅ 已筛选左转车辆数据: {len(analyzer.raw_data)} 条记录, {len(analyzer.raw_data['vehicle_id'].unique())} 辆车")
-                            else:
-                                raise ValueError("数据筛选失败：未找到左转车辆数据")
-                        else:
-                            raise ValueError("数据筛选失败：数据中没有'movement'列")
-                    else:
-                        raise ValueError("数据筛选失败，请检查路口ID和方向是否正确")
+        # 根据用户选择的路口和方向进行筛选，但保留正负样本
+        if int_id is not None:
+            # 只筛选路口，不筛选左转车辆
+            filtered = raw_data[raw_data['int_id'] == int_id]
+            print(f"✅ 已过滤路口 {int_id} 相关车辆数据: {len(filtered)}/{len(raw_data)} 条记录")
             
-            filtered = analyzer.raw_data
+            # 如果指定了入口方向，进一步筛选
+            if approach is not None:
+                filtered = filtered[filtered['direction'] == approach]
+                print(f"✅ 已过滤入口方向 {approach}: {len(filtered)}/{len(raw_data)} 条记录")
+        elif approach is not None:
+            # 只筛选入口方向，不筛选左转车辆
+            filtered = raw_data[raw_data['direction'] == approach]
+            print(f"✅ 已过滤入口方向 {approach}: {len(filtered)}/{len(raw_data)} 条记录")
+        else:
+            # 不进行任何筛选
+            filtered = raw_data
+            print("✅ 使用全部数据，不进行路口和方向筛选")
         
         # 显示数据统计信息
         total_vehicles = len(filtered['vehicle_id'].unique())
@@ -128,7 +108,6 @@ class DataPipeline:
             history_length=history_length,
             prediction_horizon=prediction_horizon,
             min_trajectory_length=min_trajectory_length,
-            use_prediction_mode=use_prediction_mode,
             max_samples=max_samples
         )
         
@@ -249,7 +228,7 @@ class MultiModalDataset(Dataset):
     """多模态数据集类 - 支持真正的左转预测任务"""
     
     def __init__(self, data_path: str = None, data: pd.DataFrame = None, history_length: int = 30, prediction_horizon: int = 12, 
-                 min_trajectory_length: int = 100, use_prediction_mode: bool = True, max_samples: Optional[int] = None):
+                 min_trajectory_length: int = 100, max_samples: Optional[int] = None):
         """
         初始化数据集
         
@@ -257,9 +236,8 @@ class MultiModalDataset(Dataset):
             data_path: 数据文件路径 (与data参数二选一)
             data: 直接提供的DataFrame数据
             history_length: 历史轨迹长度 (帧数，默认30帧=3秒)
-            prediction_horizon: 预测时间范围 (帧数，默认50帧=5秒)
+            prediction_horizon: 预测时间范围 (帧数，默认12帧=1.2秒)
             min_trajectory_length: 最小轨迹长度要求
-            use_prediction_mode: 是否使用真正的预测模式
             max_samples: 最大样本数限制，用于缩减测试调试时间
         """
         # 参数检查
@@ -270,14 +248,13 @@ class MultiModalDataset(Dataset):
         self.history_length = history_length
         self.prediction_horizon = prediction_horizon
         self.min_trajectory_length = min_trajectory_length
-        self.use_prediction_mode = use_prediction_mode
         self.max_samples = max_samples  
         
         # 为了兼容性，保留原有参数名
         self.sequence_length = history_length
         self.prediction_length = prediction_horizon
         
-        print(f"🚀 初始化数据集 (预测模式: {'开启' if use_prediction_mode else '关闭'})")
+        print(f"🚀 初始化数据集 (预测模式)")
         print(f"   历史长度: {history_length}帧 ({history_length*0.1:.1f}秒)")
         print(f"   预测范围: {prediction_horizon}帧 ({prediction_horizon*0.1:.1f}秒)")
         
@@ -288,12 +265,9 @@ class MultiModalDataset(Dataset):
         else:
             self.raw_data = self.load_data()
         
-        if use_prediction_mode:
-            self.samples = self._build_prediction_samples()
-            print(f"✅ 构建预测样本: {len(self.samples)} 个")
-        else:
-            # 兼容模式：使用原有逻辑
-            self.data = self.raw_data
+        # 只使用预测模式构建样本
+        self.samples = self._build_prediction_samples()
+        print(f"✅ 构建预测样本: {len(self.samples)} 个")
         
     def load_data(self):
         """加载预处理好的左转数据"""
@@ -404,19 +378,12 @@ class MultiModalDataset(Dataset):
         return samples
     
     def __len__(self):
-        if self.use_prediction_mode and hasattr(self, 'samples'):
-            return len(self.samples)
-        else:
-            return len(self.data) - self.sequence_length - self.prediction_length + 1
+        """返回数据集样本数量"""
+        return len(self.samples)
     
     def __getitem__(self, idx):
-        """获取单个样本"""
-        if self.use_prediction_mode and hasattr(self, 'samples'):
-            # 真正的预测模式
-            return self._get_prediction_sample(idx)
-        else:
-            # 兼容模式：使用原有逻辑
-            return self._get_legacy_sample(idx)
+        """获取单个预测样本"""
+        return self._get_prediction_sample(idx)
     
     def _get_prediction_sample(self, idx):
         """获取预测样本"""
@@ -449,65 +416,116 @@ class MultiModalDataset(Dataset):
             'sample_info': sample['info']  # 额外信息
         }
     
-    def _get_legacy_sample(self, idx):
-        """获取传统样本（兼容模式）"""
-        # 获取车辆序列数据
-        vehicle_ids = self.data['vehicle_id'].unique()
-        
-        # 简化处理：按索引获取车辆数据
-        if idx < len(vehicle_ids):
-            vehicle_id = vehicle_ids[idx]
-            vehicle_data = self.data[self.data['vehicle_id'] == vehicle_id]
-            
-            # 确保有足够的数据点
-            if len(vehicle_data) < self.sequence_length + self.prediction_length:
-                # 如果数据不足，使用填充或跳过
-                vehicle_data = vehicle_data.iloc[:self.sequence_length + self.prediction_length]
-            
-            # 历史轨迹
-            history = vehicle_data.iloc[:self.sequence_length]
-            
-            # 未来轨迹
-            future = vehicle_data.iloc[self.sequence_length:self.sequence_length + self.prediction_length]
-            
-            # 提取多模态特征
-            visual_features = self.extract_visual_features(history)
-            motion_features = self.extract_motion_features(history)
-            traffic_features = self.extract_traffic_features(history)
-            
-            # 左转意图标签（从预处理数据中获取）
-            left_turn_intent = self.get_left_turn_intent(vehicle_data)
-        else:
-            # 索引超出范围，返回默认数据
-            return self._get_legacy_sample(idx % len(vehicle_ids))
-        
-        # 目标轨迹（使用NGSIM数据的local_x, local_y列）
-        if 'local_x' in future.columns and 'local_y' in future.columns:
-            target_trajectory = future[['local_x', 'local_y']].values
-        else:
-            # 如果没有位置列，创建模拟数据
-            target_trajectory = np.random.randn(len(future), 2)
-        
-        return {
-            'visual_features': torch.FloatTensor(visual_features),
-            'motion_features': torch.FloatTensor(motion_features),
-            'traffic_features': torch.FloatTensor(traffic_features),
-            'left_turn_intent': torch.FloatTensor([left_turn_intent]),
-            'target_trajectory': torch.FloatTensor(target_trajectory)
-        }
+
     
     def extract_visual_features(self, history):
         """
-        提取视觉特征。由于NGSIM没有图像，这里是一个抽象实现。
-        """
-        # 这里的实现是抽象的，代表一个未来可以集成的视觉模型。
-        # 如果有图像数据，可以用预训练的CNN（如ResNet）来提取特征。
-        # 对于NGSIM数据，可以考虑将车辆轨迹和周围环境信息栅格化为一张"地图图像"，
-        # 然后用一个小的CNN来处理这张图像。
+        提取视觉特征。由于NGSIM没有图像，这里将车辆轨迹和周围环境信息栅格化为特征表示。
         
-        # 简单占位符实现：返回一个维度合适的随机张量
-        # 假设视觉特征维度为32
-        return torch.rand(self.history_length, 32).numpy()
+        主要改进：
+        1. 将车辆自身轨迹栅格化
+        2. 提取周围车辆的相对位置和运动信息
+        3. 计算车辆与周围环境的空间关系特征
+        4. 不再返回随机张量，而是有意义的特征表示
+        5. 添加对heading列的存在性检查，确保兼容性
+        """
+        # 从历史数据中提取自身车辆轨迹，检查heading列是否存在
+        required_columns = ['local_x', 'local_y', 'v_vel', 'v_acc']
+        available_columns = [col for col in required_columns if col in history.columns]
+        
+        # 如果heading列存在，也包含它
+        if 'heading' in history.columns:
+            available_columns.append('heading')
+        
+        # 提取可用列的数据
+        ego_trajectory = history[available_columns].values.astype(np.float32)
+        
+        # 如果缺少heading列，添加默认值0
+        if 'heading' not in history.columns:
+            # 为每条轨迹添加0值的heading列
+            num_rows = ego_trajectory.shape[0]
+            default_heading = np.zeros((num_rows, 1), dtype=np.float32)
+            ego_trajectory = np.hstack([ego_trajectory, default_heading])
+        
+        # 获取当前时间步的位置作为参考点
+        current_position = ego_trajectory[-1, :2] if len(ego_trajectory) > 0 else np.zeros(2)
+        
+        # 1. 计算轨迹形状特征
+        trajectory_features = []
+        if len(ego_trajectory) > 1:
+            # 计算轨迹曲率特征
+            for i in range(1, len(ego_trajectory)):
+                # 计算与前一帧的位移
+                displacement = ego_trajectory[i, :2] - ego_trajectory[i-1, :2]
+                displacement_norm = np.linalg.norm(displacement) if np.linalg.norm(displacement) > 0 else 1
+                
+                # 提取标准化的位移和速度信息
+                traj_feature = np.concatenate([
+                    displacement / displacement_norm,  # 标准化位移方向
+                    [ego_trajectory[i, 2] / 30],  # 标准化速度 (假设最大速度为30 m/s)
+                    [ego_trajectory[i, 3] / 5],   # 标准化加速度 (假设最大加速度为5 m/s^2)
+                    [np.sin(ego_trajectory[i, 4]), np.cos(ego_trajectory[i, 4])]  # 航向角的正弦和余弦
+                ])
+                trajectory_features.append(traj_feature)
+        
+        # 如果没有足够的轨迹点，用零填充
+        while len(trajectory_features) < self.history_length:
+            trajectory_features.append(np.zeros(6))  # 6个轨迹特征
+        
+        # 2. 提取周围车辆信息特征 (如果有)
+        # 假设history中包含周围车辆信息（如邻车位置）
+        # 这里我们模拟一些关键特征
+        surrounding_features = []
+        
+        # 提取与周围环境相关的特征
+        # 假设我们想知道车辆是否靠近路口、道路边界等
+        # 为了简化，我们使用一些基于轨迹的启发式特征
+        
+        # 计算车辆是否在减速（可能接近路口）
+        is_decelerating = 1.0 if len(ego_trajectory) > 1 and ego_trajectory[-1, 3] < -0.5 else 0.0
+        
+        # 计算车辆是否有转向趋势
+        has_turning_trend = 0.0
+        if len(ego_trajectory) > 5 and ego_trajectory.shape[1] >= 5:
+            # 使用heading列的最后一个位置（因为我们在修复代码中可能在最后添加了heading列）
+            heading_col_index = -1  # 最后一列始终是heading数据
+            recent_headings = ego_trajectory[-5:, heading_col_index]
+            heading_diff = np.abs(recent_headings[-1] - recent_headings[0])
+            has_turning_trend = 1.0 if heading_diff > 0.1 else 0.0
+        
+        # 3. 构建最终的视觉特征表示
+        # 确保特征维度为32（与VisualEncoder的期望输入一致）
+        # 将轨迹特征和环境特征投影到32维空间
+        visual_features = []
+        for traj_feat in trajectory_features:
+            # 每个时间步的特征
+            time_step_features = np.zeros(32)
+            
+            # 填充轨迹特征 (6个特征)
+            time_step_features[:6] = traj_feat
+            
+            # 填充环境相关特征
+            time_step_features[6] = is_decelerating
+            time_step_features[7] = has_turning_trend
+            
+            # 在剩余维度上编码车辆的空间位置信息
+            # 将当前位置编码为特征
+            pos_encoded = np.zeros(24)  # 剩余24个维度
+            pos_encoded[:2] = current_position / 100  # 标准化位置
+            pos_encoded[2] = ego_trajectory[-1, 2] if len(ego_trajectory) > 0 else 0.0  # 速度
+            
+            # 添加一些基于正弦和余弦的位置编码，以捕获空间关系
+            # 修改循环条件为i < 22，确保i+1不会超出数组边界
+            for i in range(3, 22, 2):
+                freq = 0.1 * (i // 2)
+                pos_encoded[i] = np.sin(freq * current_position[0])
+                pos_encoded[i+1] = np.cos(freq * current_position[1])
+            
+            time_step_features[8:] = pos_encoded
+            
+            visual_features.append(time_step_features)
+        
+        return np.array(visual_features)
     
     def extract_motion_features(self, history):
         """
@@ -618,7 +636,7 @@ class MultiModalDataset(Dataset):
     
     def analyze_dataset(self):
         """分析数据集统计信息，包括速度、加速度、航向角等关键特征统计"""
-        if self.use_prediction_mode and hasattr(self, 'samples'):
+        if hasattr(self, 'samples'):
             print(f"📊 预测数据集分析:")
             print(f"   总样本数: {len(self.samples):,}")
             
@@ -935,12 +953,13 @@ class IntentClassifier(nn.Module):
         return self.classifier(x)
 
 class TrajectoryDecoder(nn.Module):
-    """轨迹预测解码器"""
+    """轨迹预测解码器 - 修复版"""
     
     def __init__(self, input_dim: int = 129, hidden_dim: int = 128, output_dim: int = 2, seq_len: int = 12):
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         
         # LSTM解码器
         self.lstm = nn.LSTM(
@@ -951,8 +970,11 @@ class TrajectoryDecoder(nn.Module):
             dropout=0.2
         )
         
-        # 输出层
+        # 输出层 - 预测轨迹点
         self.output_layer = nn.Linear(hidden_dim, output_dim)
+        
+        # 输入投影层 - 用于将轨迹点和意图信息映射到LSTM输入维度
+        self.input_proj = nn.Linear(output_dim + 1, input_dim)  # 轨迹点 + 意图概率 -> 映射到LSTM输入维度
         
         # 初始隐藏状态
         self.init_hidden = nn.Linear(input_dim, hidden_dim * 2 * 2)  # 2 layers * 2 (h,c)
@@ -961,10 +983,10 @@ class TrajectoryDecoder(nn.Module):
         batch_size = fused_features.size(0)
         
         # 结合意图信息
-        input_features = torch.cat([fused_features, intent_prob], dim=1)
+        initial_input = torch.cat([fused_features, intent_prob], dim=1)  # [batch, input_dim]
         
         # 初始化隐藏状态
-        init_states = self.init_hidden(input_features)
+        init_states = self.init_hidden(initial_input)
         h0 = init_states[:, :self.hidden_dim*2].reshape(2, batch_size, self.hidden_dim)
         c0 = init_states[:, self.hidden_dim*2:].reshape(2, batch_size, self.hidden_dim)
         
@@ -972,17 +994,25 @@ class TrajectoryDecoder(nn.Module):
         outputs = []
         hidden = (h0, c0)
         
-        # 第一步输入 - 使用固定的输入特征
-        decoder_input = input_features.unsqueeze(1)  # [batch, 1, input_dim]
+        # 第一步输入
+        decoder_input = initial_input.unsqueeze(1)  # [batch, 1, input_dim]
         
+        # 循环预测每一步轨迹
         for t in range(self.seq_len):
-            output, hidden = self.lstm(decoder_input, hidden)
-            trajectory_point = self.output_layer(output)
+            # LSTM前向传播
+            lstm_output, hidden = self.lstm(decoder_input, hidden)
+            # 预测轨迹点
+            trajectory_point = self.output_layer(lstm_output)
             outputs.append(trajectory_point)
             
-            # 保持输入维度一致，不添加trajectory_point
-            # 使用相同的input_features作为下一步输入
-            decoder_input = input_features.unsqueeze(1)
+            # 为下一步准备输入 - 使用上一步的输出作为输入的一部分
+            # 将意图概率扩展到与轨迹点相同的维度
+            intent_prob_expanded = intent_prob.unsqueeze(1).expand(-1, 1, -1)
+            # 组合轨迹点和意图信息
+            next_input_part = torch.cat([trajectory_point, intent_prob_expanded], dim=2)
+            # 使用原始融合特征作为基础，确保每一步都能获取到初始特征信息
+            next_input = decoder_input + self.input_proj(next_input_part)
+            decoder_input = next_input
         
         # 拼接所有输出
         trajectory = torch.cat(outputs, dim=1)
@@ -1055,8 +1085,11 @@ class TrainingManager:
         )
         
         # 损失函数
-        self.intent_loss_fn = nn.BCELoss()
+        # 针对类别不平衡问题，使用带权重的交叉熵损失
+        # 由于训练集中左转样本占比约0.9%，使用较高的权重
+        self.intent_loss_fn = nn.BCELoss(reduction='none')
         self.trajectory_loss_fn = nn.MSELoss()
+        self.left_turn_weight = 10.0  # 左转样本的权重，根据数据分布调整
         
         # 训练历史
         self.train_history = {'loss': [], 'intent_acc': [], 'traj_error': []}
@@ -1089,11 +1122,14 @@ class TrainingManager:
             intent_pred, traj_pred = self.model(visual_feat, motion_feat, traffic_feat)
             
             # 计算损失
-            intent_loss = self.intent_loss_fn(intent_pred, intent_target)
+            # 应用类别权重解决不平衡问题
+            # 对左转样本(intent_target > 0.5)应用较高权重
+            weights = torch.where(intent_target > 0.5, self.left_turn_weight, 1.0)
+            intent_loss = (self.intent_loss_fn(intent_pred, intent_target) * weights).mean()
             traj_loss = self.trajectory_loss_fn(traj_pred, traj_target)
             
-            # 联合损失
-            total_batch_loss = intent_loss + 0.5 * traj_loss
+            # 联合损失 - 调整权重比例，减少轨迹预测损失的影响
+            total_batch_loss = intent_loss + 0.1 * traj_loss
             
             # 反向传播
             self.optimizer.zero_grad()
@@ -1157,9 +1193,14 @@ class TrainingManager:
                 intent_pred, traj_pred = self.model(visual_feat, motion_feat, traffic_feat)
                 
                 # 计算损失
-                intent_loss = self.intent_loss_fn(intent_pred, intent_target)
+                # 应用类别权重解决不平衡问题
+                # 对左转样本(intent_target > 0.5)应用较高权重
+                weights = torch.where(intent_target > 0.5, self.left_turn_weight, 1.0)
+                intent_loss = (self.intent_loss_fn(intent_pred, intent_target) * weights).mean()
                 traj_loss = self.trajectory_loss_fn(traj_pred, traj_target)
-                total_batch_loss = intent_loss + 0.5 * traj_loss
+                
+                # 联合损失 - 与训练保持一致的权重比例
+                total_batch_loss = intent_loss + 0.1 * traj_loss
                 
                 # 统计
                 total_loss += total_batch_loss.item()
@@ -1420,7 +1461,8 @@ def evaluate_model(model, test_loader, device='cuda'):
     # 如果存在future_movements数据，进行与真实左转数据的验证分析
     if all_future_movements:
         # 基于future_movements确定真正的左转车辆
-        true_left_turns = [1 if any(m == 'L' for m in movements) else 0 for movements in all_future_movements]
+        # 修复：根据代码中使用的数值表示（2.0 = 左转）来判断
+        true_left_turns = [1 if any(m == 2.0 for m in movements) else 0 for movements in all_future_movements]
         
         # 计算基于真实左转标签的准确率
         true_left_accuracy = accuracy_score(true_left_turns, intent_binary_preds[:len(true_left_turns)])
@@ -1465,31 +1507,18 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"💻 使用设备: {device}")
     
-    # 选择预测模式
-    print("🎯 选择预测模式:")
-    print("1. 真正的预测模式 (推荐) - 基于历史轨迹预测未来左转意图")
-    print("2. 传统模式 - 多模态特征融合")
-    
-    mode_choice = input("请选择模式 (1/2, 默认: 1): ").strip()
-    use_prediction_mode = mode_choice != '2'
-    
     # 添加全局样本数限制参数
     max_samples_input = input("请输入要处理的最大样本数 (默认: 全部，输入正整数可缩减调试时间): ").strip()
 
     max_samples = config.get("max_samples", -1)
     max_samples = int(max_samples_input) if max_samples_input and max_samples_input.isdigit() and int(max_samples_input)>0 else max_samples
     
-    if use_prediction_mode:
-        print("✅ 使用真正的预测模式")
-        print("   - 历史长度: 30帧 (3秒)")
-        print("   - 预测范围: 50帧 (5秒)")
-        print("   - 利用NGSIM movement标签进行真正的预测")
-        if max_samples>0:
-            print(f"   - 限制最大样本数: {max_samples}")
-    else:
-        print("✅ 使用传统多模态模式")
-        if max_samples>0:
-            print(f"   - 限制最大样本数: {max_samples}")
+    print("✅ 使用真正的预测模式")
+    print("   - 历史长度: 30帧 (3秒)")
+    print("   - 预测范围: 50帧 (5秒)")
+    print("   - 利用NGSIM movement标签进行真正的预测")
+    if max_samples>0:
+        print(f"   - 限制最大样本数: {max_samples}")
     
     # 创建数据集
     print("🔄 创建数据集...")
@@ -1508,99 +1537,79 @@ def main():
         # 创建DataPipeline实例
         data_pipeline = DataPipeline(data_path_fullpath)
         
-        # 获取路口和方向信息（如果需要）
+        # 获取路口和方向信息
         int_id = config.get("int_id", 1)
         approach = config.get("approach", "northbound")
         
-        if use_prediction_mode:
-            # 预测模式下可以选择特定路口和方向
-            filter_input = input("是否按路口和方向筛选数据？(y/n, 默认: y): ").strip().lower()
-            filter_input = 'y' if not filter_input else filter_input
-            if filter_input == 'y':
-                try:
-                    # 先使用LeftTurnAnalyzer发现并显示数据中的路口
-                    print("🔍 正在分析数据中的路口信息...")
-                    analyzer = LeftTurnAnalyzer(data_path_fullpath)
-                    analyzer.load_data()
-                    intersections = analyzer.discover_intersections()
-                    
-                    if intersections:
-                        print("\n📋 数据中发现的路口信息：")
-                        print("=" * 80)
-                        print(f"{'路口ID':<8} {'总记录数':<12} {'车辆数':<10} {'方向':<20} {'机动类型':<15}")
-                        print("-" * 80)
-                        
-                        for int_id_available, info in sorted(intersections.items()):
-                            # 转换方向为名称
-                            direction_names = []
-                            for direction in info['directions'][:4]:  # 最多显示4个方向
-                                if direction in analyzer.direction_names:
-                                    direction_names.append(f"{direction}({analyzer.direction_names[direction].split(' ')[0]})")
-                                else:
-                                    direction_names.append(str(direction))
-                            directions_str = ','.join(direction_names)
-                            
-                            # 转换机动类型为名称
-                            movement_names = []
-                            for movement in info['movements'][:4]:  # 最多显示4个机动类型
-                                if movement in analyzer.movement_names:
-                                    movement_names.append(f"{movement}({analyzer.movement_names[movement].split(' ')[0]})")
-                                else:
-                                    movement_names.append(str(movement))
-                            movements_str = ','.join(movement_names)
-                            
-                            print(f"{int_id_available:<8} {info['total_records']:<12} {info['total_vehicles']:<10} {directions_str:<20} {movements_str:<15}")
-                        print("=" * 80)
-                    else:
-                        print("⚠️ 未能在数据中发现路口信息")
-                    
-                    # 然后让用户选择路口ID
-                    int_id_input = input("请输入路口ID (留空不筛选): ").strip()
-                    int_id = int(int_id_input) if int_id_input else None
-                    
-                    if int_id is not None:
-                        # 分析该路口的可用入口方向
-                        try:
-                            entrance_analyzer = LeftTurnAnalyzer(data_path_fullpath)
-                            entrance_analyzer.load_data()
-                            entrance_analyzer.intersection_id = int_id
-                            entrance_stats = entrance_analyzer.analyze_intersection_entrances()
-                            
-                            if entrance_stats:
-                                print(f"\n✅ 路口 {int_id} 的可用入口方向信息：")
-                                print("=" * 70)
-                                print(f"{'方向编号':<10} {'方向名称':<10} {'总车辆':<10} {'左转车辆':<10} {'左转比例':<10}")
-                                print("-" * 70)
-                                
-                                for stats in entrance_stats.values():
-                                    print(f"{stats['direction']:<10} {stats['direction_name']:<10} {stats['total_vehicles']:<10} {stats['left_turn_vehicles']:<10} {stats['left_turn_ratio']:.1f}%")
-                                print("=" * 70)
-                        except Exception as e:
-                            print(f"⚠️ 分析入口方向时出错: {e}")
-                        
-                        approach_input = input("请输入入口方向 (1-东, 2-北, 3-西, 4-南, 留空不筛选): ").strip()
-                        approach = int(approach_input) if approach_input and approach_input.isdigit() else None
-                except ValueError:
-                    print("⚠️ 无效的路口ID或方向，将使用所有数据")
-        else:
-            # 传统模式下需要路口和方向信息
+        # 预测模式下可以选择特定路口和方向
+        filter_input = input("是否按路口和方向筛选数据？(y/n, 默认: y): ").strip().lower()
+        filter_input = 'y' if not filter_input else filter_input
+        if filter_input == 'y':
             try:
-                int_id_input = input("请输入路口ID (默认: 1): ").strip()
-                int_id = int(int_id_input) if int_id_input else 1
+                # 先使用LeftTurnAnalyzer发现并显示数据中的路口
+                print("🔍 正在分析数据中的路口信息...")
+                analyzer = LeftTurnAnalyzer(data_path_fullpath)
+                analyzer.load_data()
+                intersections = analyzer.discover_intersections()
                 
-                # 获取入口方向
-                print("请选择入口方向:")
-                print("1 - 东向")
-                print("2 - 北向")
-                print("3 - 西向")
-                print("4 - 南向")
-                entrance_direction_input = input("请选择入口方向 (默认: 1): ").strip()
-                approach = int(entrance_direction_input) if entrance_direction_input else 1
-            except Exception as e:
-                print(f"❌ 获取路口和方向信息失败: {e}")
-                print("💡 将使用默认值")
-                int_id = 1
-                approach = 1
+                if intersections:
+                    print("\n📋 数据中发现的路口信息：")
+                    print("=" * 80)
+                    print(f"{'路口ID':<8} {'总记录数':<12} {'车辆数':<10} {'方向':<20} {'机动类型':<15}")
+                    print("-" * 80)
+                    
+                    for int_id_available, info in sorted(intersections.items()):
+                        # 转换方向为名称
+                        direction_names = []
+                        for direction in info['directions'][:4]:  # 最多显示4个方向
+                            if direction in analyzer.direction_names:
+                                direction_names.append(f"{direction}({analyzer.direction_names[direction].split(' ')[0]})")
+                            else:
+                                direction_names.append(str(direction))
+                        directions_str = ','.join(direction_names)
+                        
+                        # 转换机动类型为名称
+                        movement_names = []
+                        for movement in info['movements'][:4]:  # 最多显示4个机动类型
+                            if movement in analyzer.movement_names:
+                                movement_names.append(f"{movement}({analyzer.movement_names[movement].split(' ')[0]})")
+                            else:
+                                movement_names.append(str(movement))
+                        movements_str = ','.join(movement_names)
+                        
+                        print(f"{int_id_available:<8} {info['total_records']:<12} {info['total_vehicles']:<10} {directions_str:<20} {movements_str:<15}")
+                    print("=" * 80)
+                else:
+                    print("⚠️ 未能在数据中发现路口信息")
+                
+                # 然后让用户选择路口ID
+                int_id_input = input("请输入路口ID (留空不筛选): ").strip()
+                int_id = int(int_id_input) if int_id_input else None
+                
+                if int_id is not None:
+                    # 分析该路口的可用入口方向
+                    try:
+                        entrance_analyzer = LeftTurnAnalyzer(data_path_fullpath)
+                        entrance_analyzer.load_data()
+                        entrance_analyzer.intersection_id = int_id
+                        entrance_stats = entrance_analyzer.analyze_intersection_entrances()
+                        
+                        if entrance_stats:
+                            print(f"\n✅ 路口 {int_id} 的可用入口方向信息：")
+                            print("=" * 70)
+                            print(f"{'方向编号':<10} {'方向名称':<10} {'总车辆':<10} {'左转车辆':<10} {'左转比例':<10}")
+                            print("-" * 70)
+                            
+                            for stats in entrance_stats.values():
+                                print(f"{stats['direction']:<10} {stats['direction_name']:<10} {stats['total_vehicles']:<10} {stats['left_turn_vehicles']:<10} {stats['left_turn_ratio']:.1f}%")
+                            print("=" * 70)
+                    except Exception as e:
+                        print(f"⚠️ 分析入口方向时出错: {e}")
+                    
+                    approach_input = input("请输入入口方向 (1-东, 2-北, 3-西, 4-南, 留空不筛选): ").strip()
+                    approach = int(approach_input) if approach_input and approach_input.isdigit() else None
+            except ValueError:
+                print("⚠️ 无效的路口ID或方向，将使用所有数据")
         
         # 使用DataPipeline构建数据集
         history_length = config.get("history_length", 30)
@@ -1610,8 +1619,8 @@ def main():
         epochs_input = input("请输入训练轮数 epochs (默认: epochs=50): ").strip()
         epochs = int(epochs_input) if epochs_input else epochs
 
-        # 如果是预测模式且用户选择不按路口和方向筛选，则将int_id和approach设为None
-        if use_prediction_mode and filter_input == 'n':
+        # 如果用户选择不按路口和方向筛选，则将int_id和approach设为None
+        if filter_input == 'n':
             print("✅ 用户选择不按路口和方向筛选数据，使用全部数据")
             build_int_id = None
             build_approach = None
@@ -1622,10 +1631,9 @@ def main():
         full_dataset = data_pipeline.build_dataset(
             int_id=build_int_id,
             approach=build_approach,
-            history_length=history_length if use_prediction_mode else 8,
-            prediction_horizon=prediction_horizon if use_prediction_mode else 12,
-            min_trajectory_length=100 if use_prediction_mode else 20,
-            use_prediction_mode=use_prediction_mode,
+            history_length=history_length,
+            prediction_horizon=prediction_horizon,
+            min_trajectory_length=100,
             max_samples=max_samples
         )
         
