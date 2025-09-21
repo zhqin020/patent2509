@@ -73,31 +73,54 @@ class DataPipeline:
         # 加载数据
         analyzer.load_data()
         
-        # 如果是无特定路口ID的情况，确保selected_entrance为None以便筛选所有左转车辆
-        if int_id is None:
+        # 如果是无特定路口ID的情况，确保selected_entrance为None以便不进行筛选
+        if int_id is None and approach is None:
             analyzer.selected_entrance = None
-        
-        # 筛选左转数据
-        success = analyzer.filter_entrance_data()
-        if not success:
-            # 如果筛选失败但数据不为空，检查是否有左转车辆
-            if analyzer.raw_data is not None and len(analyzer.raw_data) > 0:
-                print("🔍 尝试筛选所有左转车辆...")
-                if 'movement' in analyzer.raw_data.columns:
-                    left_turn_data = analyzer.raw_data[analyzer.raw_data['movement'] == 2]
-                    if len(left_turn_data) > 0:
-                        analyzer.raw_data = left_turn_data
-                        print(f"✅ 已筛选左转车辆数据: {len(analyzer.raw_data)} 条记录, {len(analyzer.raw_data['vehicle_id'].unique())} 辆车")
-                    else:
-                        raise ValueError("数据筛选失败：未找到左转车辆数据")
+            print("✅ 使用全部数据，不进行路口和方向筛选")
+            filtered = analyzer.raw_data
+        else:
+            # 筛选数据
+            if use_prediction_mode:
+                # 预测模式下需要正负样本，不能只筛选左转车辆
+                # 先尝试按路口和方向筛选数据
+                success = analyzer.filter_entrance_data()
+                if not success:
+                    print("⚠️ 按路口和方向筛选失败，将使用原始数据进行正负样本构建")
+                    # 不做数据过滤，让MultiModalDataset自己处理正负样本
+                    filtered = analyzer.raw_data
                 else:
-                    raise ValueError("数据筛选失败：数据中没有'movement'列")
+                    filtered = analyzer.raw_data
             else:
-                raise ValueError("数据筛选失败，请检查路口ID和方向是否正确")
+                # 非预测模式下只需要左转车辆数据
+                success = analyzer.filter_entrance_data()
+                if not success:
+                    # 如果筛选失败但数据不为空，检查是否有左转车辆
+                    if analyzer.raw_data is not None and len(analyzer.raw_data) > 0:
+                        print("🔍 尝试筛选所有左转车辆...")
+                        if 'movement' in analyzer.raw_data.columns:
+                            left_turn_data = analyzer.raw_data[analyzer.raw_data['movement'] == 2]
+                            if len(left_turn_data) > 0:
+                                analyzer.raw_data = left_turn_data
+                                print(f"✅ 已筛选左转车辆数据: {len(analyzer.raw_data)} 条记录, {len(analyzer.raw_data['vehicle_id'].unique())} 辆车")
+                            else:
+                                raise ValueError("数据筛选失败：未找到左转车辆数据")
+                        else:
+                            raise ValueError("数据筛选失败：数据中没有'movement'列")
+                    else:
+                        raise ValueError("数据筛选失败，请检查路口ID和方向是否正确")
+            
+            filtered = analyzer.raw_data
         
-        # 获取筛选后的左转数据
-        filtered = analyzer.raw_data
-        print(f"✅ 数据筛选完成: {len(filtered)} 条记录, {len(filtered['vehicle_id'].unique())} 辆车")
+        # 显示数据统计信息
+        total_vehicles = len(filtered['vehicle_id'].unique())
+        left_turn_vehicles = 0
+        if 'movement' in filtered.columns:
+            left_turn_vehicles = len(filtered[filtered['movement'] == 2]['vehicle_id'].unique())
+            left_turn_percentage = (left_turn_vehicles / total_vehicles * 100) if total_vehicles > 0 else 0
+            print(f"✅ 数据准备完成: {len(filtered)} 条记录, {total_vehicles} 辆车")
+            print(f"   左转车辆数: {left_turn_vehicles} ({left_turn_percentage:.1f}%)")
+        else:
+            print(f"✅ 数据准备完成: {len(filtered)} 条记录, {total_vehicles} 辆车")
         
         # 直接使用DataFrame创建数据集，避免临时文件
         dataset = MultiModalDataset(
@@ -116,6 +139,67 @@ class DataPipeline:
         if hasattr(dataset, 'analyze_dataset'):
             return dataset.analyze_dataset()
         return {}
+    
+    def analyze_dataset_split(self, train_dataset, val_dataset, test_dataset):
+        """
+        分析划分后各数据集的左转车辆分布
+        
+        Args:
+            train_dataset: 训练集
+            val_dataset: 验证集
+            test_dataset: 测试集
+        """
+        print("\n📊 各数据集左转车辆分布统计 (按movement):")
+        
+        # 定义统计函数
+        def count_movement(dataset_subset):
+            # 获取原始数据集
+            original_dataset = dataset_subset.dataset
+            
+            # 检查是否有samples属性和movement信息
+            if hasattr(original_dataset, 'samples'):
+                # 对于预测模式的数据集
+                total_count = 0
+                left_turn_count = 0
+                
+                # 遍历子集的所有索引
+                for idx in dataset_subset.indices:
+                    sample = original_dataset.samples[idx]
+                    total_count += 1
+                    # 假设label=1表示左转
+                    if sample['label'] == 1:
+                        left_turn_count += 1
+                
+                return total_count, left_turn_count
+            
+            # 对于原始数据模式
+            if hasattr(original_dataset, 'raw_data'):
+                # 获取子集对应的原始数据
+                subset_data = original_dataset.raw_data.iloc[dataset_subset.indices]
+                total_count = len(subset_data['vehicle_id'].unique())
+                
+                # 统计左转车辆
+                if 'movement' in subset_data.columns:
+                    # 假设movement=2表示左转
+                    left_turn_vehicles = subset_data[subset_data['movement'] == 2]['vehicle_id'].unique()
+                    left_turn_count = len(left_turn_vehicles)
+                    return total_count, left_turn_count
+            
+            return 0, 0
+        
+        # 统计各数据集
+        datasets = [
+            (train_dataset, "训练集"),
+            (val_dataset, "验证集"),
+            (test_dataset, "测试集")
+        ]
+        
+        for dataset, name in datasets:
+            total, left = count_movement(dataset)
+            percentage = (left / total * 100) if total > 0 else 0
+            print(f"   {name}:")
+            print(f"      总车辆数: {total:,}")
+            print(f"      左转车辆数: {left:,} ({percentage:.1f}%)")
     
     def split_dataset(self, dataset, train_ratio=0.7, val_ratio=0.15):
         """
@@ -1431,7 +1515,7 @@ def main():
         if use_prediction_mode:
             # 预测模式下可以选择特定路口和方向
             filter_input = input("是否按路口和方向筛选数据？(y/n, 默认: y): ").strip().lower()
-            filter_input = 'y' if not filter_input else 'n'
+            filter_input = 'y' if not filter_input else filter_input
             if filter_input == 'y':
                 try:
                     # 先使用LeftTurnAnalyzer发现并显示数据中的路口
@@ -1526,9 +1610,18 @@ def main():
         epochs_input = input("请输入训练轮数 epochs (默认: epochs=50): ").strip()
         epochs = int(epochs_input) if epochs_input else epochs
 
+        # 如果是预测模式且用户选择不按路口和方向筛选，则将int_id和approach设为None
+        if use_prediction_mode and filter_input == 'n':
+            print("✅ 用户选择不按路口和方向筛选数据，使用全部数据")
+            build_int_id = None
+            build_approach = None
+        else:
+            build_int_id = int_id
+            build_approach = approach
+
         full_dataset = data_pipeline.build_dataset(
-            int_id=int_id,
-            approach=approach,
+            int_id=build_int_id,
+            approach=build_approach,
             history_length=history_length if use_prediction_mode else 8,
             prediction_horizon=prediction_horizon if use_prediction_mode else 12,
             min_trajectory_length=100 if use_prediction_mode else 20,
@@ -1541,6 +1634,9 @@ def main():
         
         # 使用DataPipeline进行数据集划分
         train_dataset, val_dataset, test_dataset = data_pipeline.split_dataset(full_dataset)
+        
+        # 分析各数据集的左转车辆分布
+        data_pipeline.analyze_dataset_split(train_dataset, val_dataset, test_dataset)
         
     except Exception as e:
         print(f"❌ 数据处理失败: {e}")
